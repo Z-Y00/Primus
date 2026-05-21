@@ -9,6 +9,7 @@ logs
 local/
 .gitmodules
 output
+outputs
 experiment
 data
 pp_simulation_result
