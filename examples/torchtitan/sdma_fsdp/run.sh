@@ -140,6 +140,10 @@ docker run --name "${CNAME}" \
         echo "############################################################"
         echo "  [2/4] Install Primus deps + init torchtitan submodule"
         echo "############################################################"
+        # The Primus repo is bind-mounted from the host; modern git refuses
+        # to operate on it because the host UID != container root. Whitelist
+        # all bind-mounted paths as safe so submodule init works.
+        git config --global --add safe.directory '*'
         cd /workspace/primus
         if [ ! -f third_party/torchtitan/torchtitan/train.py ]; then
             git submodule update --init --depth 1 third_party/torchtitan
