@@ -142,8 +142,10 @@ docker run --name "${CNAME}" \
         echo "############################################################"
         # The Primus repo is bind-mounted from the host; modern git refuses
         # to operate on it because the host UID != container root. Whitelist
-        # all bind-mounted paths as safe so submodule init works.
-        git config --global --add safe.directory '*'
+        # all bind-mounted paths as safe so submodule init works. Note the
+        # double-quotes -- the outer bash -c block is single-quoted, so a
+        # single-quoted '*' here would lose the quotes and get globbed.
+        git config --global --add safe.directory "*"
         cd /workspace/primus
         if [ ! -f third_party/torchtitan/torchtitan/train.py ]; then
             git submodule update --init --depth 1 third_party/torchtitan
