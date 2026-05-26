@@ -1,4 +1,28 @@
-# Primus
+# Primus (Z-Y00 fork — SDMA-FSDP enablement)
+
+> This fork carries a small TorchTitan-backend patch
+> (`primus/backends/torchtitan/patches/sdma_symm_mem_collectives.py`)
+> that wraps PyTorch's `fully_shard()` so FSDP's all-gather /
+> reduce-scatter buffers come from `symm_mem` (cuMem), causing RCCL to
+> dispatch the collective on the AMD **SDMA copy engines** instead of
+> the default CU-based `ncclDevKernel_Generic_2`.
+>
+> ### Reproduce in two commands (8x MI300X + Docker)
+>
+> ```bash
+> git clone -b feature/sdma-symm-mem-fsdp https://github.com/Z-Y00/Primus.git
+> cd Primus && ./examples/torchtitan/sdma_fsdp/run.sh
+> ```
+>
+> Pulls the container image, builds the LD_PRELOAD interposer, stages
+> the public Llama-3.1 70B tokenizer, and runs the SDMA-on Llama-3 70B
+> BF16 FSDP training for 5 steps with `HSA_SDMA_LINEAR_B2B=0` (full
+> SDMA bandwidth on this build). All knobs (`SCALE=8b`,
+> `SDMA_MODE=off` for the A/B baseline, `STEPS=20`, …) plus the
+> upstream ROCm source pin for `HSA_SDMA_LINEAR_B2B` are documented in
+> [`examples/torchtitan/sdma_fsdp/README.md`](examples/torchtitan/sdma_fsdp/README.md).
+
+---
 
 **Primus/Primus-LM** is a flexible and high-performance training framework designed for large-scale foundation model training and inference on AMD GPUs. It supports **pretraining**, **posttraining**, and **reinforcement learning** workflows with multiple backends including [Megatron-LM](https://github.com/NVIDIA/Megatron-LM), [TorchTitan](https://github.com/pytorch/torchtitan), and [JAX MaxText](https://github.com/google/maxtext), alongside ROCm-optimized components.
 
