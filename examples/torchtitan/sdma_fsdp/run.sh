@@ -231,6 +231,7 @@ EOF
              --env NCCL_SOCKET_IFNAME=lo \
              --env GLOO_SOCKET_IFNAME=lo \
              --env LD_PRELOAD=/tmp/libhip_attr_drain.so \
+             --env HSA_SDMA_LINEAR_B2B="${HSA_SDMA_LINEAR_B2B}" \
              -- train pretrain --config "${CONFIG_REL}" \
             2>&1 | tee /workspace/outputs/train.log
     '
