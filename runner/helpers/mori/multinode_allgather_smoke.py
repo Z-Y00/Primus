@@ -12,7 +12,7 @@ from primus.backends.common.mori_allgather import MoriAllGather
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--numel", type=int, default=4 * 1024 * 1024)
+    parser.add_argument("--numel", type=int, default=64 * 1024 * 1024)
     args = parser.parse_args()
 
     local_rank = int(os.environ["LOCAL_RANK"])

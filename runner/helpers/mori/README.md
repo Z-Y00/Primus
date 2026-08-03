@@ -6,20 +6,35 @@ Primus uses MORI's FSDP2 `MoriAllGather` adapter when:
 export MORI_ALL_GATHER=1
 ```
 
-## Build the tested image
+## Runtime preflight and build
 
-From the Primus repository root:
+MORI must inspect the live NIC driver, firmware, vendor library, and runtime
+capabilities such as ionic CCQE. A static `docker build` cannot reliably see
+those host devices. Run MORI mode through the unified Primus preflight command
+on every target node:
 
 ```bash
-docker build \
-  -f runner/helpers/mori/Dockerfile \
-  --build-arg MORI_DEVICE_NIC=bnxt \
-  -t primus-mori:bnxt .
+cd /apps/tas/lorrirao/sdma_rccl_pytorch/primus
+
+runner/primus-cli direct -- preflight --mori
 ```
 
-The Dockerfile follows MORI's upstream `docker/Dockerfile.dev` dependency list
-and pins the MORI source revision used for Primus validation. Its default base
-is the tested ROCm 7.15 Primus nightly. The source build is required for now:
+The CLI invokes `primus/tools/preflight/mori_preflight.py`, which runs
+`mori_preflight.sh` on every selected node. The shell worker:
+
+1. Prints host identity, GPU, IP, RDMA links, valid GIDs, NIC
+   driver/firmware, vendor-library hash, and required DV symbols.
+2. Starts a privileged temporary container from the ROCm 7.15 Primus nightly.
+3. Mounts the detected host vendor library into that container.
+4. Calls `runner/helpers/mori/install_mori.sh` to install dependencies, clone
+   the pinned source/submodules, and build MORI with live RDMA visibility.
+5. Runs an 8-GPU bit-exact all-gather smoke.
+6. When `--mori-nodes` is set, keeps the temporary containers for this same
+   information/build/local smoke on
+   every node, verifies matching node fingerprints, then launches one
+   all-gather over all `8 × N` ranks before removing them.
+
+The source build is required for now:
 
 - `amd_mori==1.2.2` installs but does not expose
   `mori.ccl.HierAllGather`.
@@ -27,9 +42,45 @@ is the tested ROCm 7.15 Primus nightly. The source build is required for now:
   with the image's Python environment.
 - The merged MORI source contains `HierAllGather` and the FSDP adapter API.
 
-`MORI_DEVICE_NIC` must match the target cluster (`bnxt`, `mlx5`, or `ionic`).
-Docker builds cannot reliably auto-detect host RDMA devices, so the Dockerfile
-defaults to `bnxt` for the validated MI300X cluster.
+The preflight always pulls `BASE_IMAGE`; Docker reuses cached layers when it is
+already current. No image is saved. Logs and phase timing are written under
+`/tmp/primus-mori-preflight-<node>-<timestamp>/`.
+
+### Vendor library names
+
+The library names used by preflight come directly from MORI:
+
+| NIC | MORI runtime loader names |
+|---|---|
+| Ionic / AINIC | `libionic.so` |
+| Broadcom BNXT | `libbnxt_re.so`, then `libbnxt_re-rdmav59.so`, then `libbnxt_re-rdmav34.so` |
+| Mellanox mlx5 | `libmlx5.so` |
+
+MORI's
+[`dv_loader.hpp`](https://github.com/ROCm/mori/blob/main/include/mori/application/transport/rdma/providers/dv_loader.hpp)
+uses these exact `dlopen()` names. Its
+[`MoriDetectDevice.cmake`](https://github.com/ROCm/mori/blob/main/cmake/MoriDetectDevice.cmake)
+uses the same names for build-time `find_library()` detection. Preflight mounts
+the host's detected vendor library under these aliases so build-time detection
+and runtime loading use the same library.
+
+### Install MORI for real training
+
+Run the same installer as root inside the actual training container where the
+GPU, RDMA sysfs, and vendor userspace library are visible:
+
+```bash
+cd /workspace/Primus
+runner/helpers/mori/install_mori.sh
+```
+
+The installer modifies the current training environment: it installs system
+and Python build dependencies, checks out pinned MORI under `/opt/mori`, builds
+it, and installs the resulting package into the active Python environment.
+
+Useful overrides are `MORI_REPO`, `MORI_REF`, `MORI_SOURCE_DIR`, `MAX_JOBS`,
+and `ROCM_PATH`. The installer clears `MORI_DEVICE_NIC` so MORI detects the
+live NIC and mounted vendor library.
 
 ## Run
 
@@ -42,60 +93,29 @@ MORI_ALL_GATHER=1 \
 
 Do not combine `MORI_ALL_GATHER=1` with `SDMA_ALL_GATHER=1`.
 
-The launcher hook supplies correctness-safe single-node defaults:
-
-```text
-MORI_ENABLE_SDMA=1
-MORI_SHMEM_HEAP_SIZE=8G
-MORI_HIER_CUDA_GRAPH=0
-```
-
-Explicit user values override these defaults.
+The launcher hook supplies correctness-safe SDMA, shared-memory, and graph-mode
+defaults. Explicit user values override them.
 
 ## Reproduce the validated MI355X two-node run
 
-The validated pair used identical AINIC stacks:
 
-| Setting | Value |
-|---|---|
-| Master | `smci355-ccs-aus-n04-33` |
-| Worker | `smci355-ccs-aus-n05-21` |
-| Driver | `26.03.3.001` |
-| Firmware | `1.117.5-a-77` |
-| `libionic` hash prefix | `1ab5ac7f6dda` |
-| CCQE | enabled on both nodes |
-| Bootstrap interface | `fenic` |
-| RCCL GID index | `1` |
-
-Do not mix nodes with different driver, firmware, or `libionic` builds. MORI
-detects CCQE capability independently on each node; a `ccqe=True/False`
-mismatch causes incompatible kernels and a collective hang.
-
-### 1. Build the ionic image
+### 1. Run general multi-node preflight
 
 ```bash
 cd /apps/tas/lorrirao/sdma_rccl_pytorch/primus
 
-docker build \
-  -f runner/helpers/mori/Dockerfile \
-  --build-arg MORI_DEVICE_NIC=ionic \
-  -t primus-mori:ionic .
+runner/primus-cli direct -- preflight --mori \
+  --mori-nodes smci355-ccs-aus-n04-33,smci355-ccs-aus-n05-21 \
+  --mori-socket-ifname fenic \
+  --mori-gid-index 1
 ```
 
-### 2. Make the image available on both nodes
+The Python orchestrator runs `mori_preflight.sh` concurrently on every node.
+Every node prints the same host/GPU/IP/RDMA/GID/driver/firmware/vendor-library
+information, builds and tests its own runtime-detected image, and emits a
+fingerprint. A mismatch fails before the N-node collective starts.
 
-If a shared registry is unavailable, stream the image directly:
-
-```bash
-for node in smci355-ccs-aus-n04-33 smci355-ccs-aus-n05-21; do
-  docker save primus-mori:ionic |
-    zstd -1 -T0 |
-    ssh "${node}" 'zstd -d -T0 | docker load' &
-done
-wait
-```
-
-### 3. Prepare the shared TorchTitan data directory
+### 2. Prepare the shared TorchTitan data directory
 
 TorchTitan node rank 0 downloads tokenizer assets while other node ranks wait
 for the same file. Both containers must mount the same directory:
@@ -110,34 +130,87 @@ The default tokenizer token path is:
 /apps/tas/lorrirao/.cache/huggingface/token
 ```
 
-Override `SHARED_DATA` or `HF_TOKEN_PATH` when launching if needed.
+Mount this directory at `/workspace/Primus/data` and the token file at
+`/run/hf_token` when creating each training container.
 
-### 4. Run the validations
+### 3. Prepare both training containers
+
+`preflight --mori --mori-nodes ...` already runs both the per-node 8-GPU
+checks and the general N-node collective. It does not save an image.
+
+In the actual training container on each node, install MORI and export the
+validated two-node settings. The hostname expression assigns rank 0 to the
+validated master and rank 1 to the validated worker:
 
 ```bash
-# Bit-exact 16-rank MORI all-gather, 8 MiB per rank.
-IMAGE=primus-mori:ionic \
-  runner/helpers/mori/run_mi355_multinode.sh collective
+cd /workspace/Primus
+runner/helpers/mori/install_mori.sh
 
-# TorchTitan Qwen3 0.6B, FSDP, 2 layers, 3 steps.
-IMAGE=primus-mori:ionic \
-  runner/helpers/mori/run_mi355_multinode.sh torchtitan
-
-# Megatron Llama 3.2 1B, FSDP2, 2 layers, 3 iterations.
-IMAGE=primus-mori:ionic \
-  runner/helpers/mori/run_mi355_multinode.sh megatron
+export NNODES=2
+export GPUS_PER_NODE=8
+export NODE_RANK="$(
+  [[ "$(hostname -s)" == "smci355-ccs-aus-n04-33" ]] && echo 0 || echo 1
+)"
+export MASTER_ADDR=10.235.192.139
+export MASTER_PORT=29620
+export NCCL_SOCKET_IFNAME=fenic
+export GLOO_SOCKET_IFNAME=fenic
+export NCCL_IB_GID_INDEX=1
+export MORI_ALL_GATHER=1
+unset MORI_DEVICE_NIC
 ```
 
-Useful overrides:
+For another node set, change `NODE_RANK`, `MASTER_ADDR`,
+`NCCL_SOCKET_IFNAME`, `GLOO_SOCKET_IFNAME`, and `NCCL_IB_GID_INDEX` to match
+its preflight result.
+
+### 4. Run TorchTitan on both nodes
+
+Mount the shared data directory at `/workspace/Primus/data` and the Hugging
+Face token at `/run/hf_token`, then copy this command into both containers:
+Start it on both nodes without waiting for rank 0 to return.
 
 ```bash
-MASTER_NODE=<host> \
-WORKER_NODE=<host> \
-MASTER_ADDR=<master-fenic-ip> \
-NCCL_IB_GID_INDEX=<valid-ipv4-rocev2-index> \
-IMAGE=<image> \
-LOG_DIR=<local-log-dir> \
-runner/helpers/mori/run_mi355_multinode.sh collective
+export HF_TOKEN="$(< /run/hf_token)"
+
+bash runner/primus-cli direct \
+  --log_file "/workspace/torchtitan_mori_node${NODE_RANK}.log" \
+  -- train pretrain \
+  --config examples/torchtitan/configs/MI355X/qwen3_0.6B-pretrain.yaml \
+  --model.n_layers 2 \
+  --model.converters= \
+  --training.steps 3 \
+  --training.mock_data True \
+  --training.seq_len 128 \
+  --training.local_batch_size 1 \
+  --metrics.log_freq 1 \
+  --compile.enable False \
+  --job.dump_folder "/workspace/torchtitan_mori_outputs_node${NODE_RANK}"
+```
+
+### 5. Run Megatron on both nodes
+
+Alternatively, start this command in both prepared containers:
+
+```bash
+bash runner/primus-cli direct \
+  --log_file "/workspace/megatron_mori_node${NODE_RANK}.log" \
+  -- train pretrain \
+  --config examples/megatron/configs/MI355X/llama3.2_1B-BF16-pretrain.yaml \
+  --use_torch_fsdp2 true \
+  --use_distributed_optimizer false \
+  --overlap_param_gather false \
+  --overlap_grad_reduce false \
+  --num_layers 2 \
+  --train_iters 3 \
+  --seq_length 128 \
+  --max_position_embeddings 128 \
+  --micro_batch_size 1 \
+  --global_batch_size "$((GPUS_PER_NODE * NNODES))" \
+  --enable_primus_turbo false \
+  --use_turbo_attention false \
+  --use_turbo_grouped_gemm false \
+  --ckpt_format torch_dist
 ```
 
 ### Expected success markers
@@ -145,7 +218,7 @@ runner/helpers/mori/run_mi355_multinode.sh collective
 Collective:
 
 ```text
-MORI_MULTINODE_ALLGATHER_PASS world=16 ranks_per_node=8 per_rank_mb=8.0
+MORI_MULTINODE_ALLGATHER_PASS world=16 ranks_per_node=8 per_rank_mb=128.0
 ```
 
 Training:
@@ -166,7 +239,7 @@ The Megatron smoke should report three iterations with
   matching ionic stacks.
 - `local GID N/A`: inspect `/sys/class/infiniband/ionic_*/ports/1/gids/`;
   this pair uses `NCCL_IB_GID_INDEX=1`, not `3`.
-- Non-master node waits forever for tokenizer: ensure `SHARED_DATA` is mounted
-  into `/workspace/Primus/data` on both nodes.
+- Non-master node waits forever for tokenizer: ensure the same host data
+  directory is mounted at `/workspace/Primus/data` on every node.
 - BNXT `231.x`: unsupported for MORI IBGDA; use supported firmware/userspace or
   a validated mlx5/ionic pair.
