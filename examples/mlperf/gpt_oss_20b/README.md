@@ -11,10 +11,13 @@ older base Triton for compatibility with the same Turbo branch.
 
 ```bash
 cd examples/mlperf/gpt_oss_20b
-docker build --network host \
-  -f Dockerfile.runtime-v26.5 \
-  -t primus:gpt-oss-20b-mlperf-v26.5 .
+./build_rccl_sdma_image.sh
 ```
+
+The SDMA image defaults to Primus branch
+`feature/gptoss-rccl-sdma-flydsl` and Primus-Turbo commit
+`9c58dc318ed1780e55f9743cb410a1108b50ff29`. Override `IMAGE_TAG`,
+`PRIMUS_REF`, or `PRIMUS_TURBO_REF` when testing another revision.
 
 Use `Dockerfile.runtime-v26.3` and a v26.3 tag for the compatibility stack.
 Push a shared tag with `docker push <image>`.
@@ -59,6 +62,37 @@ submission defaults: MLPerf trainer, 1.2M iteration ceiling, 128-step warmup,
 FP8 Triton grouped GEMM, fused wgrad accumulation, and disabled profiling.
 Short diagnostics and backend ablations should override environment variables
 outside the checked-in submission config.
+
+## Self-contained mock-data A/B
+
+The following commands require only one 8x MI355X node and the image built
+above. No tokenizer, checkpoint, or training dataset is required. Both modes
+use the same FP8 FlyDSL configuration, including
+`turbo_fused_grouped_gemm: true`.
+
+```bash
+MODE=baseline STEPS=50 ./run_rccl_sdma_mock.sh
+MODE=sdma STEPS=50 ./run_rccl_sdma_mock.sh
+MODE=direct STEPS=3 ./run_rccl_sdma_mock.sh
+```
+
+The script shares its precompiled attention cache through
+`$PWD/gptoss-runtime-cache` by default, so the second A/B run does not repeat
+the expensive v26.5 CK-JIT prewarm. Override `CACHE_DIR` if needed.
+
+The recipe defaults to 24 DDP buckets, matching the 24 transformer layers.
+Override this with `DDP_NUM_BUCKETS`. The `sdma` mode uses a dedicated zero-CTA
+RCCL process group and 512 MiB of bounded symmetric scratch; override the
+capacity with `SCRATCH_BYTES`. The `direct` mode allocates Megatron parameter
+buffers from symmetric memory and is provided as a short feasibility test
+because its contiguous VMM allocation can exhaust HBM. Increasing
+`ddp_num_buckets` does not split `_ParamAndGradBuffer.param_data`; the tested
+24-bucket direct run still failed at `ncclMemAlloc`. True per-layer direct
+allocation requires splitting the underlying Megatron parameter buffer.
+
+The Docker launcher intentionally raises `nofile` to 1,048,576. RCCL's extra
+communicator can exhaust Docker's default 1,024-descriptor soft limit and then
+block in `ncclOsSocketTryAccept`.
 
 ## v26.5 attention prewarm
 
