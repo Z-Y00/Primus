@@ -9,6 +9,7 @@
 Activation is deliberately separate from Primus's direct-HIP SDMA backend:
 
     MEGATRON_PARAM_GATHER_BACKEND=rccl_sdma
+    MEGATRON_RCCL_SDMA_DIRECT=1  # optional direct symmetric-buffer path
 
 The replacement touches only ``_ParamAndGradBucketGroup.start_param_sync``.
 Gradient ReduceScatter, gradient-norm AllReduce, and other collectives retain
@@ -17,19 +18,27 @@ their original process groups and algorithms.
 
 from __future__ import annotations
 
+import functools
+import inspect
 import os
+
+import torch
 
 from primus.core.patches import PatchContext, register_patch
 from primus.core.utils.module_utils import log_rank_0, warning_rank_0
 
-
 BACKEND_ENV = "MEGATRON_PARAM_GATHER_BACKEND"
 RCCL_SDMA_BACKEND = "rccl_sdma"
+DIRECT_GATHER_ENV = "MEGATRON_RCCL_SDMA_DIRECT"
 _EAGER_RUNTIME_INITIALIZED = False
 
 
 def rccl_sdma_param_gather_enabled(_ctx: PatchContext | None = None) -> bool:
     return os.getenv(BACKEND_ENV, "").strip().lower() == RCCL_SDMA_BACKEND
+
+
+def direct_param_gather_enabled() -> bool:
+    return rccl_sdma_param_gather_enabled() and os.getenv(DIRECT_GATHER_ENV, "0") == "1"
 
 
 def validate_global_cta_policy() -> None:
@@ -51,7 +60,7 @@ def validate_global_cumem_enable() -> None:
         raise RuntimeError(
             "MEGATRON_PARAM_GATHER_BACKEND=rccl_sdma requires "
             "NCCL_CUMEM_ENABLE to be unset or 0. The dedicated parameter-"
-            "AllGather group manages its symmetric scratch allocation without "
+            "AllGather group manages its symmetric allocations without "
             "enabling cuMem process-wide."
         )
 
@@ -62,8 +71,10 @@ def make_start_param_sync(original):
 
     from primus.backends.megatron.core.distributed.rccl_sdma_param_gather import (
         DEFAULT_SCRATCH_BYTES,
+        get_direct_runtime,
         get_runtime,
         get_sdma_process_group,
+        is_direct_param_buffer,
     )
 
     def start_param_sync(self, force_sync: bool = False):
@@ -90,19 +101,23 @@ def make_start_param_sync(original):
             jobs.append((bucket.param_data, local_data))
 
         if jobs:
-            capacity_bytes = int(
-                os.getenv(
-                    "MEGATRON_RCCL_SDMA_SCRATCH_BYTES",
-                    str(DEFAULT_SCRATCH_BYTES),
+            group = get_sdma_process_group(self.intra_distributed_optimizer_instance_group)
+            if direct_param_gather_enabled() and all(
+                is_direct_param_buffer(output) for output, _input in jobs
+            ):
+                runtime = get_direct_runtime(group, jobs[0][0].device)
+            else:
+                capacity_bytes = int(
+                    os.getenv(
+                        "MEGATRON_RCCL_SDMA_SCRATCH_BYTES",
+                        str(DEFAULT_SCRATCH_BYTES),
+                    )
                 )
-            )
-            runtime = get_runtime(
-                get_sdma_process_group(
-                    self.intra_distributed_optimizer_instance_group
-                ),
-                jobs[0][0].device,
-                capacity_bytes,
-            )
+                runtime = get_runtime(
+                    group,
+                    jobs[0][0].device,
+                    capacity_bytes,
+                )
             work = runtime.enqueue(jobs)
             if async_op:
                 self.param_gather_handle = work
@@ -114,6 +129,57 @@ def make_start_param_sync(original):
         self.param_gather_dispatched = True
 
     return start_param_sync
+
+
+def make_param_and_grad_buffer_init(original):
+    """Allocate eligible Megatron parameter buffers from the symmetric pool."""
+    signature = inspect.signature(original)
+
+    @functools.wraps(original)
+    def wrapped(self, *args, **kwargs):
+        bound = signature.bind(self, *args, **kwargs)
+        bound.apply_defaults()
+        ddp_config = bound.arguments["ddp_config"]
+        params = bound.arguments["params"]
+        original_group = bound.arguments["data_parallel_group"]
+        nccl_ub = bound.arguments["nccl_ub"]
+
+        # nccl_ub owns a separate registered pool. MXFP8 may alias parameter
+        # and gradient storage, so both retain the compatibility scratch path.
+        from megatron.core.distributed.param_and_grad_buffer import is_mxfp8tensor
+
+        eligible = (
+            ddp_config.use_distributed_optimizer
+            and not nccl_ub
+            and not any(is_mxfp8tensor(param) for param in params)
+        )
+        if not eligible:
+            return original(self, *args, **kwargs)
+
+        from primus.backends.megatron.core.distributed.rccl_sdma_param_gather import (
+            mark_direct_param_buffer,
+            prepare_direct_param_buffer_pool,
+            rendezvous_direct_param_buffer,
+        )
+
+        device = params[0].device
+        group, pool = prepare_direct_param_buffer_pool(original_group, device)
+        with torch.cuda.use_mem_pool(pool):
+            result = original(self, *args, **kwargs)
+
+        if self.param_data is None:
+            return result
+        symmetric_memory = rendezvous_direct_param_buffer(self.param_data, group)
+        # Keep the pool and rendezvous handle alive for the buffer lifetime.
+        self._primus_rccl_sdma_pool = pool
+        self._primus_rccl_sdma_symmetric_memory = symmetric_memory
+        mark_direct_param_buffer(self.param_data)
+        for bucket in self.buckets:
+            if bucket.param_data is not None:
+                mark_direct_param_buffer(bucket.param_data)
+        return result
+
+    return wrapped
 
 
 def eager_initialize_runtime() -> bool:
@@ -129,6 +195,7 @@ def eager_initialize_runtime() -> bool:
         DEFAULT_SCRATCH_BYTES,
         get_runtime,
         get_sdma_process_group,
+        prepare_direct_param_buffer_pool,
     )
 
     if not dist.is_initialized():
@@ -136,17 +203,20 @@ def eager_initialize_runtime() -> bool:
     device = torch.device("cuda", torch.cuda.current_device())
     world_probe = torch.zeros(1, dtype=torch.int32, device=device)
     dist.broadcast(world_probe, src=0)
-    capacity_bytes = int(
-        os.getenv(
-            "MEGATRON_RCCL_SDMA_SCRATCH_BYTES",
-            str(DEFAULT_SCRATCH_BYTES),
+    if direct_param_gather_enabled():
+        prepare_direct_param_buffer_pool(dist.group.WORLD, device)
+    else:
+        capacity_bytes = int(
+            os.getenv(
+                "MEGATRON_RCCL_SDMA_SCRATCH_BYTES",
+                str(DEFAULT_SCRATCH_BYTES),
+            )
         )
-    )
-    get_runtime(
-        get_sdma_process_group(dist.group.WORLD),
-        device,
-        capacity_bytes,
-    )
+        get_runtime(
+            get_sdma_process_group(dist.group.WORLD),
+            device,
+            capacity_bytes,
+        )
     _EAGER_RUNTIME_INITIALIZED = True
     return True
 
@@ -198,10 +268,17 @@ def patch_rccl_sdma_param_all_gather(ctx: PatchContext) -> None:
 
     marker = "_primus_rccl_sdma_param_gather_patched"
     if not getattr(bucket_group, marker, False):
-        bucket_group.start_param_sync = make_start_param_sync(
-            bucket_group.start_param_sync
-        )
+        bucket_group.start_param_sync = make_start_param_sync(bucket_group.start_param_sync)
         setattr(bucket_group, marker, True)
+
+    if direct_param_gather_enabled():
+        param_and_grad_buffer = getattr(pgb, "_ParamAndGradBuffer", None)
+        if param_and_grad_buffer is None:
+            raise RuntimeError("RCCL-SDMA direct gather requires _ParamAndGradBuffer")
+        direct_marker = "_primus_rccl_sdma_direct_allocation_patched"
+        if not getattr(param_and_grad_buffer, direct_marker, False):
+            param_and_grad_buffer.__init__ = make_param_and_grad_buffer_init(param_and_grad_buffer.__init__)
+            setattr(param_and_grad_buffer, direct_marker, True)
 
     if os.getenv("MEGATRON_RCCL_SDMA_EAGER_INIT", "0") == "1":
         if not eager_initialize_runtime():
@@ -223,6 +300,4 @@ def patch_rccl_sdma_param_all_gather(ctx: PatchContext) -> None:
                 init_module._initialize_distributed = wrapped_initialize_distributed
                 setattr(init_module, eager_marker, True)
 
-    log_rank_0(
-        "[Patch:megatron.distributed.rccl_sdma_param_all_gather] installed"
-    )
+    log_rank_0("[Patch:megatron.distributed.rccl_sdma_param_all_gather] installed")
