@@ -95,6 +95,23 @@ def test_global_cta_policy_is_rejected_for_megatron_backend(monkeypatch):
         rccl_sdma_param_all_gather_patches.validate_global_cta_policy()
 
 
+def test_global_cumem_enable_is_rejected_for_megatron_backend(monkeypatch):
+    monkeypatch.setenv("NCCL_CUMEM_ENABLE", "1")
+
+    with pytest.raises(RuntimeError, match="requires NCCL_CUMEM_ENABLE"):
+        rccl_sdma_param_all_gather_patches.validate_global_cumem_enable()
+
+
+@pytest.mark.parametrize("value", [None, "0"])
+def test_disabled_global_cumem_is_allowed(monkeypatch, value):
+    if value is None:
+        monkeypatch.delenv("NCCL_CUMEM_ENABLE", raising=False)
+    else:
+        monkeypatch.setenv("NCCL_CUMEM_ENABLE", value)
+
+    rccl_sdma_param_all_gather_patches.validate_global_cumem_enable()
+
+
 def test_dedicated_group_gets_zero_cta_without_mutating_original(monkeypatch):
     class OriginalGroup:
         def __init__(self):
@@ -155,6 +172,7 @@ def _run_sdma_hook(extra_env):
         "FSDP_ALL_GATHER_BACKEND",
         "MEGATRON_PARAM_GATHER_BACKEND",
         "NCCL_CTA_POLICY",
+        "NCCL_CUMEM_ENABLE",
     ):
         env.pop(name, None)
     env.update(extra_env)
@@ -175,6 +193,17 @@ def test_megatron_hook_does_not_emit_global_cta_policy():
     assert result.returncode == 0
     assert "env.MEGATRON_PARAM_GATHER_BACKEND=rccl_sdma" in result.stdout
     assert "env.NCCL_CTA_POLICY" not in result.stdout
+    assert "env.NCCL_CUMEM_ENABLE" not in result.stdout
+
+
+def test_fsdp_hook_keeps_global_cumem_and_cta_policy():
+    result = _run_sdma_hook(
+        {"FSDP_ALL_GATHER_BACKEND": "rccl_sdma"},
+    )
+
+    assert result.returncode == 0
+    assert "env.NCCL_CUMEM_ENABLE=1" in result.stdout
+    assert "env.NCCL_CTA_POLICY=2" in result.stdout
 
 
 def test_hook_rejects_combined_fsdp_and_megatron_backends():

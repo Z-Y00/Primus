@@ -44,6 +44,18 @@ def validate_global_cta_policy() -> None:
         )
 
 
+def validate_global_cumem_enable() -> None:
+    """Reject process-wide cuMem, which can stall non-CE Megatron work."""
+    global_cumem = os.getenv("NCCL_CUMEM_ENABLE", "").strip().lower()
+    if global_cumem not in ("", "0"):
+        raise RuntimeError(
+            "MEGATRON_PARAM_GATHER_BACKEND=rccl_sdma requires "
+            "NCCL_CUMEM_ENABLE to be unset or 0. The dedicated parameter-"
+            "AllGather group manages its symmetric scratch allocation without "
+            "enabling cuMem process-wide."
+        )
+
+
 def make_start_param_sync(original):
     """Build the RCCL CE replacement for Megatron's parameter gather."""
     from megatron.core.distributed.param_and_grad_buffer import shard_buffer
@@ -163,7 +175,7 @@ def patch_rccl_sdma_param_all_gather(ctx: PatchContext) -> None:
     # policy may already have affected WORLD/DP communicators by this phase, so
     # fail instead of silently removing it too late.
     validate_global_cta_policy()
-    os.environ["NCCL_CUMEM_ENABLE"] = "1"
+    validate_global_cumem_enable()
     os.environ["NCCL_LOCAL_REGISTER"] = "0"
     os.environ["TORCH_NCCL_USE_TENSOR_REGISTER_ALLOCATOR_HOOK"] = "true"
 
