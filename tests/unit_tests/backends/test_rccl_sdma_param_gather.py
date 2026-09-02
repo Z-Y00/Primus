@@ -5,8 +5,9 @@
 ###############################################################################
 
 import os
-from pathlib import Path
 import subprocess
+from contextlib import nullcontext
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -88,6 +89,95 @@ def test_direct_hip_patch_remains_available_without_rccl_backend(monkeypatch):
     assert sdma_param_all_gather_patches._sdma_allgather_enabled(None)
 
 
+def test_direct_rccl_gather_is_explicitly_enabled(monkeypatch):
+    monkeypatch.setenv("MEGATRON_PARAM_GATHER_BACKEND", "rccl_sdma")
+    monkeypatch.setenv("MEGATRON_RCCL_SDMA_DIRECT", "1")
+
+    assert rccl_sdma_param_all_gather_patches.direct_param_gather_enabled()
+
+
+def test_direct_buffer_marker_applies_to_views():
+    tensor = SimpleNamespace()
+
+    rccl_sdma_param_gather.mark_direct_param_buffer(tensor)
+
+    assert rccl_sdma_param_gather.is_direct_param_buffer(tensor)
+
+
+def test_param_buffer_wrapper_rendezvouses_and_marks_buckets(monkeypatch):
+    import megatron.core.distributed.param_and_grad_buffer as pgb
+
+    group = SimpleNamespace(group_name="ce", rank=lambda: 1)
+    pool = SimpleNamespace()
+    handle = SimpleNamespace()
+    param_data = SimpleNamespace()
+    bucket_data = SimpleNamespace()
+
+    monkeypatch.setattr(pgb, "is_mxfp8tensor", lambda _param: False)
+    monkeypatch.setattr(
+        rccl_sdma_param_gather,
+        "prepare_direct_param_buffer_pool",
+        lambda _group, _device: (group, pool),
+    )
+    monkeypatch.setattr(
+        rccl_sdma_param_gather,
+        "rendezvous_direct_param_buffer",
+        lambda tensor, _group: (rccl_sdma_param_gather.mark_direct_param_buffer(tensor) or handle),
+    )
+    monkeypatch.setattr(torch.cuda, "use_mem_pool", lambda _pool: nullcontext())
+
+    def original(
+        self,
+        ddp_config,
+        param_dtype,
+        grad_dtype,
+        params,
+        data_parallel_group,
+        bucket_size,
+        param_to_name,
+        gradient_scaling_factor,
+        param_indices,
+        nccl_ub,
+        pg_collection=None,
+    ):
+        del (
+            ddp_config,
+            param_dtype,
+            grad_dtype,
+            params,
+            data_parallel_group,
+            bucket_size,
+            param_to_name,
+            gradient_scaling_factor,
+            param_indices,
+            nccl_ub,
+            pg_collection,
+        )
+        self.param_data = param_data
+        self.buckets = [SimpleNamespace(param_data=bucket_data)]
+
+    wrapped = rccl_sdma_param_all_gather_patches.make_param_and_grad_buffer_init(original)
+    buffer = SimpleNamespace()
+    wrapped(
+        buffer,
+        SimpleNamespace(use_distributed_optimizer=True),
+        torch.bfloat16,
+        torch.float32,
+        [SimpleNamespace(device=torch.device("cuda", 0))],
+        SimpleNamespace(),
+        1024,
+        {},
+        1.0,
+        [0],
+        False,
+    )
+
+    assert buffer._primus_rccl_sdma_pool is pool
+    assert buffer._primus_rccl_sdma_symmetric_memory is handle
+    assert rccl_sdma_param_gather.is_direct_param_buffer(param_data)
+    assert rccl_sdma_param_gather.is_direct_param_buffer(bucket_data)
+
+
 def test_global_cta_policy_is_rejected_for_megatron_backend(monkeypatch):
     monkeypatch.setenv("NCCL_CTA_POLICY", "2")
 
@@ -163,10 +253,7 @@ def test_dedicated_group_gets_zero_cta_without_mutating_original(monkeypatch):
 
 
 def _run_sdma_hook(extra_env):
-    hook = (
-        Path(__file__).resolve().parents[3]
-        / "runner/helpers/hooks/06_enable_sdma_all_gather.sh"
-    )
+    hook = Path(__file__).resolve().parents[3] / "runner/helpers/hooks/06_enable_sdma_all_gather.sh"
     env = os.environ.copy()
     for name in (
         "FSDP_ALL_GATHER_BACKEND",

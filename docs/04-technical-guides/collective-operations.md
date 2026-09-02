@@ -215,6 +215,8 @@ For example, run the MLPerf GPT-OSS 20B configuration on one MI355X node:
 ```bash
 source examples/mlperf/gpt_oss_20b/config_MI355X_1x8x1_tp1pp1ep1_gbs32.sh
 export MEGATRON_PARAM_GATHER_BACKEND=rccl_sdma
+# Optional: gather directly into symmetric Megatron parameter buffers.
+export MEGATRON_RCCL_SDMA_DIRECT=1
 unset NCCL_CTA_POLICY
 unset NCCL_CUMEM_ENABLE
 
@@ -225,8 +227,29 @@ unset NCCL_CUMEM_ENABLE
 The configuration must use Megatron's distributed optimizer. Do not set
 `NCCL_CTA_POLICY` or `NCCL_CUMEM_ENABLE` process-wide for this backend. The
 adapter selects zero CTA only on its dedicated parameter-AllGather group and
-manages symmetric scratch through that group. Global cuMem changes every RCCL
-communicator and can stall GPT-OSS MoE execution.
+manages symmetric allocations through that group. Global cuMem changes every
+RCCL communicator and can stall GPT-OSS MoE execution.
+
+By default, the adapter gathers bounded chunks through reusable symmetric
+scratch and copies them into Megatron's parameter buffer. Set
+`MEGATRON_RCCL_SDMA_DIRECT=1` to allocate eligible Megatron parameter buffers
+from the symmetric-memory pool and gather directly into each bucket. This
+removes input staging and output copies, and permits one zero-CTA collective
+per bucket instead of scratch-capacity fragmentation.
+
+The direct path currently requires a full-world distributed-optimizer group.
+Megatron NCCL user-buffer (`nccl_ub`) and MXFP8 shared parameter/gradient
+buffers retain the scratch path. Keep the direct mode opt-in until it has been
+validated for the target model and memory configuration.
+
+On one 8-GPU MI355X GPT-OSS 20B real-C4 run, direct gather reduced steady-state
+iteration latency from 1205.8 ms to 1125.2 ms and raised throughput from 22.91
+to 24.10 samples/s versus the 256 MiB scratch path. The unmodified Megatron
+baseline remained faster at 1065.6 ms and 25.0 samples/s. Profiling showed that
+direct gather reduced parameter-AllGather calls from 160 to 8, AllGather time
+from 277.5 ms to 99.6 ms, and device-copy time from 10.0 ms to 0.24 ms. These
+numbers are workload-specific and should not be treated as general performance
+guarantees.
 
 ### Environment variables
 
