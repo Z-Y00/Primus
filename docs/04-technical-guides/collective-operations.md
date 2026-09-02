@@ -218,17 +218,18 @@ export MEGATRON_PARAM_GATHER_BACKEND=rccl_sdma
 # Optional: gather directly into symmetric Megatron parameter buffers.
 export MEGATRON_RCCL_SDMA_DIRECT=1
 unset NCCL_CTA_POLICY
-unset NCCL_CUMEM_ENABLE
+export NCCL_CUMEM_ENABLE=1
 
 ./primus-cli direct -- train pretrain \
   --config examples/mlperf/gpt_oss_20b/configs/MI355/gpt_oss_20B-FP8-mlperf-pretrain.yaml
 ```
 
 The configuration must use Megatron's distributed optimizer. Do not set
-`NCCL_CTA_POLICY` or `NCCL_CUMEM_ENABLE` process-wide for this backend. The
-adapter selects zero CTA only on its dedicated parameter-AllGather group and
-manages symmetric allocations through that group. Global cuMem changes every
-RCCL communicator and can stall GPT-OSS MoE execution.
+`NCCL_CTA_POLICY` process-wide for this backend. The adapter selects zero CTA
+only on its dedicated parameter-AllGather group and enables
+`NCCL_CUMEM_ENABLE=1`, which is required by RCCL's copy-engine path. Global
+cuMem affects every RCCL communicator and is known to stall GPT-OSS MoE on
+affected RCCL versions.
 
 By default, the adapter gathers bounded chunks through reusable symmetric
 scratch and copies them into Megatron's parameter buffer. Set
