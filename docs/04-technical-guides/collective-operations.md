@@ -204,6 +204,30 @@ The following appear in ROCm / AMD deployments and partner integrations; availab
 | **MSCCL++** | User-space collective paths aimed at **lower latency** for specific patterns and hardware. |
 | **ANP (AMD Network Plugin)** | Network backend integration (e.g. **AINIC**-oriented paths). Example: `NCCL_NET_PLUGIN` might point to `librccl-anp.so` or similar when installed (see Primus `runner/helpers/hooks/03_enable_ainic.sh`). |
 
+### Megatron distributed-optimizer parameter AllGather with RCCL SDMA
+
+Megatron can route distributed-optimizer parameter AllGather through a
+dedicated zero-CTA RCCL process group. Other communicators, including gradient
+ReduceScatter, keep their default CTA policy.
+
+For example, run the MLPerf GPT-OSS 20B configuration on one MI355X node:
+
+```bash
+source examples/mlperf/gpt_oss_20b/config_MI355X_1x8x1_tp1pp1ep1_gbs32.sh
+export MEGATRON_PARAM_GATHER_BACKEND=rccl_sdma
+unset NCCL_CTA_POLICY
+unset NCCL_CUMEM_ENABLE
+
+./primus-cli direct -- train pretrain \
+  --config examples/mlperf/gpt_oss_20b/configs/MI355/gpt_oss_20B-FP8-mlperf-pretrain.yaml
+```
+
+The configuration must use Megatron's distributed optimizer. Do not set
+`NCCL_CTA_POLICY` or `NCCL_CUMEM_ENABLE` process-wide for this backend. The
+adapter selects zero CTA only on its dedicated parameter-AllGather group and
+manages symmetric scratch through that group. Global cuMem changes every RCCL
+communicator and can stall GPT-OSS MoE execution.
+
 ### Environment variables
 
 Many deployments tune behavior with **NCCL-prefixed** variables (honored by RCCL for compatibility), for example:

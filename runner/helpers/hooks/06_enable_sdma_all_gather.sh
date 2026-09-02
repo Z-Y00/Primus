@@ -20,7 +20,9 @@
 # gradient-norm AllReduce remain on their stock RCCL path.
 #
 # For either selector, this hook:
-#   1. Exports the cuMem prerequisites used by RCCL's copy-engine path.
+#   1. Exports allocator prerequisites used by RCCL's copy-engine path. Global
+#      NCCL cuMem is enabled only for FSDP; Megatron's dedicated group manages
+#      its own symmetric scratch and must not alter other communicators.
 #   2. Propagates the selector into torchrun children.
 #   3. Rebuilds the bundled LD_PRELOAD interposer
 #      (hooks/sdma/hip_attr_drain_preload.c) into /tmp and exports
@@ -52,8 +54,7 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# 1) Common cuMem prerequisites for the RCCL copy-engine path.
-echo "env.NCCL_CUMEM_ENABLE=1"
+# 1) Common allocator prerequisites for the RCCL copy-engine path.
 echo "env.NCCL_LOCAL_REGISTER=0"
 if [[ "${TORCH_NCCL_ALLOCATOR_HOOK_OVERRIDE:-}" != "unset" ]]; then
     echo "env.TORCH_NCCL_USE_TENSOR_REGISTER_ALLOCATOR_HOOK=${TORCH_NCCL_ALLOCATOR_HOOK_OVERRIDE:-true}"
@@ -62,6 +63,7 @@ fi
 # 2) Make the active selector visible to torchrun children. primus-cli direct
 #    does not otherwise inherit arbitrary host environment variables.
 if [[ "${fsdp_backend}" == "rccl_sdma" ]]; then
+    echo "env.NCCL_CUMEM_ENABLE=1"
     echo "env.NCCL_CTA_POLICY=2"
     echo "env.FSDP_ALL_GATHER_BACKEND=rccl_sdma"
     if [[ -n "${PRIMUS_TURBO_GROUPED_GEMM_BACKEND:-}" ]]; then
