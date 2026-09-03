@@ -100,15 +100,25 @@ def make_start_param_sync(original):
                 # manage its internal stream/events, and retain its coalesced
                 # work handle for finish_param_sync().  The dedicated process
                 # group still selects RCCL's zero-CTA copy-engine path.
-                with _coalescing_manager(group, async_ops=async_op) as cm:
+                # RCCL's CE null-stream fallback uses per-peer
+                # hipMemcpyAsync, which crashes while querying imported VMM
+                # pointers in ROCr. Always ask ProcessGroupNCCL for its
+                # non-null asynchronous stream, then preserve synchronous
+                # caller semantics with an explicit wait and stream sync.
+                with _coalescing_manager(group, async_ops=True) as cm:
                     for output, local_input in jobs:
                         torch.distributed.all_gather_into_tensor(
                             output,
                             local_input,
                             group=group,
-                            async_op=async_op,
+                            async_op=True,
                         )
-                self.param_gather_handle = cm if async_op else None
+                if async_op:
+                    self.param_gather_handle = cm
+                else:
+                    cm.wait()
+                    torch.cuda.current_stream(jobs[0][0].device).synchronize()
+                    self.param_gather_handle = None
             else:
                 capacity_bytes = int(
                     os.getenv(

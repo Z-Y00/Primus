@@ -159,6 +159,80 @@ def test_direct_gather_uses_native_coalesced_work_handle(monkeypatch):
     assert bucket_group.param_gather_dispatched
 
 
+def test_direct_force_sync_uses_async_pg_stream_then_synchronizes(monkeypatch):
+    monkeypatch.setenv("MEGATRON_PARAM_GATHER_BACKEND", "rccl_sdma")
+    monkeypatch.setenv("MEGATRON_RCCL_SDMA_DIRECT", "1")
+
+    dedicated_group = SimpleNamespace()
+    wait_calls = []
+    sync_calls = []
+    coalescing_calls = []
+    gather_calls = []
+
+    class NativeHandle:
+        def wait(self):
+            wait_calls.append(True)
+
+    class ConsumerStream:
+        def synchronize(self):
+            sync_calls.append(True)
+
+    native_handle = NativeHandle()
+
+    def fake_coalescing_manager(group, async_ops):
+        coalescing_calls.append((group, async_ops))
+        return nullcontext(native_handle)
+
+    def fake_all_gather(output, local_input, group, async_op):
+        gather_calls.append((output, local_input, group, async_op))
+
+    monkeypatch.setattr(
+        torch.distributed.distributed_c10d,
+        "_coalescing_manager",
+        fake_coalescing_manager,
+    )
+    monkeypatch.setattr(torch.distributed, "all_gather_into_tensor", fake_all_gather)
+    monkeypatch.setattr(
+        torch.cuda,
+        "current_stream",
+        lambda _device: ConsumerStream(),
+    )
+    monkeypatch.setattr(
+        rccl_sdma_param_gather,
+        "get_sdma_process_group",
+        lambda _group: dedicated_group,
+    )
+
+    param_data = torch.zeros(8)
+    rccl_sdma_param_gather.mark_direct_param_buffer(param_data)
+    bucket_group = SimpleNamespace(
+        ddp_config=SimpleNamespace(
+            use_distributed_optimizer=True,
+            overlap_param_gather=True,
+        ),
+        param_gather_handle=None,
+        cached_param_buffer_shard_list=[None],
+        buckets=[SimpleNamespace(param_data=param_data)],
+        intra_distributed_optimizer_instance_size=2,
+        intra_distributed_optimizer_instance_rank=0,
+        intra_distributed_optimizer_instance_group=SimpleNamespace(),
+        param_gather_dispatched=False,
+    )
+
+    wrapped = rccl_sdma_param_all_gather_patches.make_start_param_sync(
+        lambda *_args, **_kwargs: pytest.fail("native Megatron fallback must not run")
+    )
+    wrapped(bucket_group, force_sync=True)
+
+    assert coalescing_calls == [(dedicated_group, True)]
+    assert len(gather_calls) == 1
+    assert gather_calls[0][2:] == (dedicated_group, True)
+    assert wait_calls == [True]
+    assert sync_calls == [True]
+    assert bucket_group.param_gather_handle is None
+    assert bucket_group.param_gather_dispatched
+
+
 def test_direct_buffer_marker_applies_to_views():
     tensor = SimpleNamespace()
 
