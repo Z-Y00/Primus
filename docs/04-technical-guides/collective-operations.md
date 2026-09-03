@@ -243,6 +243,11 @@ Megatron NCCL user-buffer (`nccl_ub`) and MXFP8 shared parameter/gradient
 buffers retain the scratch path. Keep the direct mode opt-in until it has been
 validated for the target model and memory configuration.
 
+See the
+[RCCL CE synchronous imported-VMM crash report](../05-operations/rccl-ce-synchronous-vmm-crash-debug-report.md)
+for the standalone reproducer, native stack, and current limitations of
+synchronous direct gather.
+
 On one 8-GPU MI355X GPT-OSS 20B real-C4 run, direct gather reduced steady-state
 iteration latency from 1205.8 ms to 1125.2 ms and raised throughput from 22.91
 to 24.10 samples/s versus the 256 MiB scratch path. The unmodified Megatron
