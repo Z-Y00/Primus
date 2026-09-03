@@ -96,12 +96,119 @@ def test_direct_rccl_gather_is_explicitly_enabled(monkeypatch):
     assert rccl_sdma_param_all_gather_patches.direct_param_gather_enabled()
 
 
+def test_direct_gather_uses_native_coalesced_work_handle(monkeypatch):
+    monkeypatch.setenv("MEGATRON_PARAM_GATHER_BACKEND", "rccl_sdma")
+    monkeypatch.setenv("MEGATRON_RCCL_SDMA_DIRECT", "1")
+
+    original_group = SimpleNamespace()
+    dedicated_group = SimpleNamespace()
+    native_handle = SimpleNamespace()
+    coalescing_calls = []
+    gather_calls = []
+
+    def fake_coalescing_manager(group, async_ops):
+        coalescing_calls.append((group, async_ops))
+        return nullcontext(native_handle)
+
+    def fake_all_gather(output, local_input, group, async_op):
+        gather_calls.append((output, local_input, group, async_op))
+
+    monkeypatch.setattr(
+        torch.distributed.distributed_c10d,
+        "_coalescing_manager",
+        fake_coalescing_manager,
+    )
+    monkeypatch.setattr(torch.distributed, "all_gather_into_tensor", fake_all_gather)
+    monkeypatch.setattr(
+        rccl_sdma_param_gather,
+        "get_sdma_process_group",
+        lambda _group: dedicated_group,
+    )
+    monkeypatch.setattr(
+        rccl_sdma_param_gather,
+        "get_runtime",
+        lambda *_args: pytest.fail("direct gather must not create the wrapper-stream runtime"),
+    )
+
+    param_data = torch.zeros(8)
+    rccl_sdma_param_gather.mark_direct_param_buffer(param_data)
+    bucket_group = SimpleNamespace(
+        ddp_config=SimpleNamespace(
+            use_distributed_optimizer=True,
+            overlap_param_gather=True,
+        ),
+        param_gather_handle=None,
+        cached_param_buffer_shard_list=[None],
+        buckets=[SimpleNamespace(param_data=param_data)],
+        intra_distributed_optimizer_instance_size=2,
+        intra_distributed_optimizer_instance_rank=0,
+        intra_distributed_optimizer_instance_group=original_group,
+        param_gather_dispatched=False,
+    )
+
+    wrapped = rccl_sdma_param_all_gather_patches.make_start_param_sync(
+        lambda *_args, **_kwargs: pytest.fail("native Megatron fallback must not run")
+    )
+    wrapped(bucket_group)
+
+    assert coalescing_calls == [(dedicated_group, True)]
+    assert len(gather_calls) == 1
+    assert gather_calls[0][0] is param_data
+    assert gather_calls[0][2:] == (dedicated_group, True)
+    assert bucket_group.param_gather_handle is native_handle
+    assert bucket_group.param_gather_dispatched
+
+
 def test_direct_buffer_marker_applies_to_views():
     tensor = SimpleNamespace()
 
     rccl_sdma_param_gather.mark_direct_param_buffer(tensor)
 
     assert rccl_sdma_param_gather.is_direct_param_buffer(tensor)
+
+
+def test_eager_direct_param_buffer_is_transferred_once(monkeypatch):
+    device = torch.device("cuda", 0)
+    group = SimpleNamespace(group_name="ce", rank=lambda: 0)
+    pool = SimpleNamespace()
+    original_empty = torch.empty
+
+    def fake_empty(*args, **kwargs):
+        if kwargs.get("device") == device:
+            kwargs = dict(kwargs)
+            kwargs.pop("device")
+        return original_empty(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "empty", fake_empty)
+    monkeypatch.setattr(torch.cuda, "use_mem_pool", lambda _pool: nullcontext())
+    rccl_sdma_param_gather.reset_runtime_state_for_tests()
+
+    rccl_sdma_param_gather.reserve_direct_param_buffer(
+        group,
+        pool,
+        device,
+        16,
+    )
+    tensor = rccl_sdma_param_gather.take_direct_param_buffer(
+        group,
+        device,
+        8,
+        torch.bfloat16,
+    )
+
+    assert tensor is not None
+    assert tensor.shape == (8,)
+    assert tensor.dtype == torch.bfloat16
+    assert tensor.count_nonzero() == 0
+    assert (
+        rccl_sdma_param_gather.take_direct_param_buffer(
+            group,
+            device,
+            8,
+            torch.bfloat16,
+        )
+        is None
+    )
 
 
 def test_param_buffer_wrapper_rendezvouses_and_marks_buckets(monkeypatch):
@@ -111,7 +218,23 @@ def test_param_buffer_wrapper_rendezvouses_and_marks_buckets(monkeypatch):
     pool = SimpleNamespace()
     handle = SimpleNamespace()
     param_data = SimpleNamespace()
+    grad_data = SimpleNamespace()
     bucket_data = SimpleNamespace()
+    pool_active = False
+    allocation_scopes = []
+
+    class PoolContext:
+        def __enter__(self):
+            nonlocal pool_active
+            pool_active = True
+
+        def __exit__(self, *_args):
+            nonlocal pool_active
+            pool_active = False
+
+    def fake_zeros(*_args, **_kwargs):
+        allocation_scopes.append(pool_active)
+        return param_data if len(allocation_scopes) == 1 else grad_data
 
     monkeypatch.setattr(pgb, "is_mxfp8tensor", lambda _param: False)
     monkeypatch.setattr(
@@ -124,7 +247,9 @@ def test_param_buffer_wrapper_rendezvouses_and_marks_buckets(monkeypatch):
         "rendezvous_direct_param_buffer",
         lambda tensor, _group: (rccl_sdma_param_gather.mark_direct_param_buffer(tensor) or handle),
     )
-    monkeypatch.setattr(torch.cuda, "use_mem_pool", lambda _pool: nullcontext())
+    monkeypatch.setattr(torch.cuda, "use_mem_pool", lambda _pool: PoolContext())
+    monkeypatch.setattr(torch, "zeros", fake_zeros)
+    monkeypatch.setattr(rccl_sdma_param_gather, "take_direct_param_buffer", lambda *_args: None)
 
     def original(
         self,
@@ -142,8 +267,6 @@ def test_param_buffer_wrapper_rendezvouses_and_marks_buckets(monkeypatch):
     ):
         del (
             ddp_config,
-            param_dtype,
-            grad_dtype,
             params,
             data_parallel_group,
             bucket_size,
@@ -153,7 +276,8 @@ def test_param_buffer_wrapper_rendezvouses_and_marks_buckets(monkeypatch):
             nccl_ub,
             pg_collection,
         )
-        self.param_data = param_data
+        self.param_data = torch.zeros(1, dtype=param_dtype, device="cuda")
+        self.grad_data = torch.zeros(1, dtype=grad_dtype, device="cuda")
         self.buckets = [SimpleNamespace(param_data=bucket_data)]
 
     wrapped = rccl_sdma_param_all_gather_patches.make_param_and_grad_buffer_init(original)
@@ -174,6 +298,8 @@ def test_param_buffer_wrapper_rendezvouses_and_marks_buckets(monkeypatch):
 
     assert buffer._primus_rccl_sdma_pool is pool
     assert buffer._primus_rccl_sdma_symmetric_memory is handle
+    assert buffer.grad_data is grad_data
+    assert allocation_scopes == [True, False]
     assert rccl_sdma_param_gather.is_direct_param_buffer(param_data)
     assert rccl_sdma_param_gather.is_direct_param_buffer(bucket_data)
 

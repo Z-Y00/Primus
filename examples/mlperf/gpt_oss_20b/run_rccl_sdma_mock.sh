@@ -7,6 +7,10 @@ STEPS="${STEPS:-50}"
 WARMUP_STEPS="${WARMUP_STEPS:-10}"
 SCRATCH_BYTES="${SCRATCH_BYTES:-536870912}"
 DDP_NUM_BUCKETS="${DDP_NUM_BUCKETS:-24}"
+EAGER_PARAM_BYTES="${EAGER_PARAM_BYTES:-41011904512}"
+PROFILE="${PROFILE:-0}"
+PROFILE_START="${PROFILE_START:-40}"
+PROFILE_END="${PROFILE_END:-42}"
 RESULTS_DIR="${RESULTS_DIR:-$PWD/gptoss-rccl-sdma-results}"
 CACHE_DIR="${CACHE_DIR:-$PWD/gptoss-runtime-cache}"
 
@@ -38,7 +42,8 @@ docker run --rm -i \
     --volume "${RESULTS_DIR}:/results" \
     --volume "${CACHE_DIR}:/root/.cache" \
     "${IMAGE}" \
-    bash -s -- "${MODE}" "${STEPS}" "${WARMUP_STEPS}" "${SCRATCH_BYTES}" "${DDP_NUM_BUCKETS}" <<'CONTAINER'
+    bash -s -- "${MODE}" "${STEPS}" "${WARMUP_STEPS}" "${SCRATCH_BYTES}" "${DDP_NUM_BUCKETS}" \
+        "${PROFILE}" "${PROFILE_START}" "${PROFILE_END}" "${EAGER_PARAM_BYTES}" <<'CONTAINER'
 set -euo pipefail
 
 MODE="$1"
@@ -46,6 +51,10 @@ STEPS="$2"
 WARMUP_STEPS="$3"
 SCRATCH_BYTES="$4"
 export DDP_NUM_BUCKETS="$5"
+PROFILE="$6"
+PROFILE_START="$7"
+PROFILE_END="$8"
+EAGER_PARAM_BYTES="$9"
 
 cd /workspace/Primus
 export PYTHONPATH="${PYTHONPATH:-}"
@@ -73,6 +82,9 @@ PY
 export EXP=/tmp/gptoss-mlperf-mock.yaml
 export PRIMUS_WORKSPACE="/results/workspace-${MODE}"
 export PRIMUS_TRAIN_ITERS="${STEPS}"
+export PRIMUS_PROFILE="$([[ "${PROFILE}" == "1" ]] && echo True || echo False)"
+export PRIMUS_PROFILE_STEP_START="${PROFILE_START}"
+export PRIMUS_PROFILE_STEP_END="${PROFILE_END}"
 export EVAL_ITERS=0
 export PRIMUS_EVAL_INTERVAL=1000000
 export SYNTH_WARMUP_STEPS="${WARMUP_STEPS}"
@@ -96,6 +108,7 @@ if [[ "${MODE}" == "sdma" || "${MODE}" == "direct" ]]; then
     export MEGATRON_RCCL_SDMA_SCRATCH_BYTES="${SCRATCH_BYTES}"
     if [[ "${MODE}" == "direct" ]]; then
         export MEGATRON_RCCL_SDMA_DIRECT=1
+        export MEGATRON_RCCL_SDMA_EAGER_PARAM_BYTES="${EAGER_PARAM_BYTES}"
     else
         export MEGATRON_RCCL_SDMA_DIRECT=0
     fi

@@ -17,6 +17,7 @@ process groups.
 
 from __future__ import annotations
 
+import math
 import os
 import threading
 import time
@@ -29,10 +30,12 @@ import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
 
 DEFAULT_SCRATCH_BYTES = 512 * 1024 * 1024
+LARGE_SEGMENT_BYTES = 2 * 1024 * 1024
 
 _RUNTIMES: dict[tuple[str, int], "_RcclSdmaRuntime"] = {}
 _DIRECT_RUNTIMES: dict[tuple[str, int], "_RcclSdmaDirectRuntime"] = {}
 _DIRECT_POOLS: dict[tuple[str, int], torch.cuda.MemPool] = {}
+_DIRECT_EAGER_PARAM_BUFFERS: dict[tuple[str, int, int], torch.Tensor] = {}
 _SDMA_GROUP: dist.ProcessGroup | None = None
 DIRECT_BUFFER_ATTR = "_primus_rccl_sdma_direct_buffer"
 
@@ -463,6 +466,76 @@ def prepare_direct_param_buffer_pool(
     return group, pool
 
 
+def reserve_direct_param_buffer(
+    group: dist.ProcessGroup | None,
+    pool: torch.cuda.MemPool,
+    device: torch.device,
+    size_bytes: int,
+) -> None:
+    """Allocate a direct parameter buffer before model allocations fragment HBM."""
+    if size_bytes <= 0:
+        raise ValueError("eager direct parameter buffer size must be positive")
+    device_index = device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    group_name = group.group_name if group is not None else ""
+    key = (group_name, device_index, size_bytes)
+    if key in _DIRECT_EAGER_PARAM_BUFFERS:
+        return
+    with torch.cuda.use_mem_pool(pool):
+        storage = torch.empty(size_bytes, dtype=torch.uint8, device=device)
+    _DIRECT_EAGER_PARAM_BUFFERS[key] = storage
+    rank = group.rank() if group is not None else int(os.getenv("RANK", "0"))
+    if rank == 0:
+        print(
+            "[RCCL-SDMA:Megatron] eagerly reserved direct parameter buffer "
+            f"bytes={size_bytes} group={group_name or '<pending>'}",
+            flush=True,
+        )
+
+
+def take_direct_param_buffer(
+    group: dist.ProcessGroup,
+    device: torch.device,
+    shape,
+    dtype: torch.dtype,
+) -> torch.Tensor | None:
+    """Transfer an exact-size eager reservation to Megatron's param_data."""
+    numel = int(shape) if isinstance(shape, int) else math.prod(shape)
+    size_bytes = numel * torch.empty((), dtype=dtype).element_size()
+    device_index = device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    matching_keys = [
+        key
+        for key in _DIRECT_EAGER_PARAM_BUFFERS
+        if key[0] in ("", group.group_name)
+        and key[1] == device_index
+        and key[2] >= size_bytes
+        and key[2] - size_bytes < LARGE_SEGMENT_BYTES
+    ]
+    if not matching_keys:
+        if group.rank() == 0:
+            print(
+                "[RCCL-SDMA:Megatron] no eager direct parameter buffer match "
+                f"requested_bytes={size_bytes} "
+                f"reserved={list(_DIRECT_EAGER_PARAM_BUFFERS)}",
+                flush=True,
+            )
+        return None
+    key = min(matching_keys, key=lambda candidate: candidate[2])
+    storage = _DIRECT_EAGER_PARAM_BUFFERS.pop(key)
+    tensor = storage[:size_bytes].view(dtype).view(shape)
+    tensor.zero_()
+    if group.rank() == 0:
+        print(
+            "[RCCL-SDMA:Megatron] consumed eager direct parameter buffer "
+            f"reserved_bytes={storage.nbytes} requested_bytes={size_bytes}",
+            flush=True,
+        )
+    return tensor
+
+
 def rendezvous_direct_param_buffer(
     tensor: torch.Tensor,
     group: dist.ProcessGroup,
@@ -495,4 +568,5 @@ def reset_runtime_state_for_tests() -> None:
     _RUNTIMES.clear()
     _DIRECT_RUNTIMES.clear()
     _DIRECT_POOLS.clear()
+    _DIRECT_EAGER_PARAM_BUFFERS.clear()
     _SDMA_GROUP = None

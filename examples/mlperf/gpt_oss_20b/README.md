@@ -84,11 +84,13 @@ The recipe defaults to 24 DDP buckets, matching the 24 transformer layers.
 Override this with `DDP_NUM_BUCKETS`. The `sdma` mode uses a dedicated zero-CTA
 RCCL process group and 512 MiB of bounded symmetric scratch; override the
 capacity with `SCRATCH_BYTES`. The `direct` mode allocates Megatron parameter
-buffers from symmetric memory and is provided as a short feasibility test
-because its contiguous VMM allocation can exhaust HBM. Increasing
-`ddp_num_buckets` does not split `_ParamAndGradBuffer.param_data`; the tested
-24-bucket direct run still failed at `ncclMemAlloc`. True per-layer direct
-allocation requires splitting the underlying Megatron parameter buffer.
+buffers from symmetric memory. It eagerly reserves a 2 MiB-aligned GPT-OSS
+parameter segment (41,011,904,512 bytes) before model allocations fragment HBM,
+transfers that storage to `param_data`, and keeps `grad_data` on the normal allocator.
+Override the reservation with `EAGER_PARAM_BYTES`. Increasing
+`ddp_num_buckets` still does not split `_ParamAndGradBuffer.param_data`; if the
+eager reservation fails, true per-layer direct allocation requires splitting
+the underlying Megatron parameter buffer.
 
 The Docker launcher intentionally raises `nofile` to 1,048,576. RCCL's extra
 communicator can exhaust Docker's default 1,024-descriptor soft limit and then

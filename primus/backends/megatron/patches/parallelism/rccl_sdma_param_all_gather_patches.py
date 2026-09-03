@@ -21,6 +21,8 @@ from __future__ import annotations
 import functools
 import inspect
 import os
+import threading
+from unittest import mock
 
 import torch
 
@@ -59,11 +61,11 @@ def make_start_param_sync(original):
 
     from primus.backends.megatron.core.distributed.rccl_sdma_param_gather import (
         DEFAULT_SCRATCH_BYTES,
-        get_direct_runtime,
         get_runtime,
         get_sdma_process_group,
         is_direct_param_buffer,
     )
+    from torch.distributed.distributed_c10d import _coalescing_manager
 
     def start_param_sync(self, force_sync: bool = False):
         if not self.ddp_config.use_distributed_optimizer:
@@ -93,7 +95,20 @@ def make_start_param_sync(original):
             if direct_param_gather_enabled() and all(
                 is_direct_param_buffer(output) for output, _input in jobs
             ):
-                runtime = get_direct_runtime(group, jobs[0][0].device)
+                # Match Megatron's native parameter-gather stream semantics:
+                # submit from the caller's current stream, let ProcessGroupNCCL
+                # manage its internal stream/events, and retain its coalesced
+                # work handle for finish_param_sync().  The dedicated process
+                # group still selects RCCL's zero-CTA copy-engine path.
+                with _coalescing_manager(group, async_ops=async_op) as cm:
+                    for output, local_input in jobs:
+                        torch.distributed.all_gather_into_tensor(
+                            output,
+                            local_input,
+                            group=group,
+                            async_op=async_op,
+                        )
+                self.param_gather_handle = cm if async_op else None
             else:
                 capacity_bytes = int(
                     os.getenv(
@@ -106,12 +121,12 @@ def make_start_param_sync(original):
                     jobs[0][0].device,
                     capacity_bytes,
                 )
-            work = runtime.enqueue(jobs)
-            if async_op:
-                self.param_gather_handle = work
-            else:
-                work.wait()
-                self.param_gather_handle = None
+                work = runtime.enqueue(jobs)
+                if async_op:
+                    self.param_gather_handle = work
+                else:
+                    work.wait()
+                    self.param_gather_handle = None
         else:
             self.param_gather_handle = None
         self.param_gather_dispatched = True
@@ -148,15 +163,42 @@ def make_param_and_grad_buffer_init(original):
             mark_direct_param_buffer,
             prepare_direct_param_buffer_pool,
             rendezvous_direct_param_buffer,
+            take_direct_param_buffer,
         )
 
         device = params[0].device
         group, pool = prepare_direct_param_buffer_pool(original_group, device)
-        with torch.cuda.use_mem_pool(pool):
+        original_zeros = torch.zeros
+        allocation_thread = threading.get_ident()
+        param_data_allocated = False
+
+        def allocate_param_data(*zeros_args, **zeros_kwargs):
+            nonlocal param_data_allocated
+            if threading.get_ident() == allocation_thread and not param_data_allocated:
+                param_data_allocated = True
+                dtype = zeros_kwargs.get("dtype")
+                if dtype is None:
+                    raise RuntimeError("RCCL-SDMA direct param_data allocation requires an explicit dtype")
+                eager_tensor = take_direct_param_buffer(
+                    group,
+                    device,
+                    zeros_args[0],
+                    dtype,
+                )
+                if eager_tensor is not None:
+                    return eager_tensor
+                with torch.cuda.use_mem_pool(pool):
+                    return original_zeros(*zeros_args, **zeros_kwargs)
+            return original_zeros(*zeros_args, **zeros_kwargs)
+
+        # Megatron allocates param_data first and grad_data second in this
+        # eligible non-MXFP8 constructor path. Only param_data participates in
+        # direct AllGather, so keep grad_data on the normal allocator.
+        with mock.patch.object(torch, "zeros", allocate_param_data):
             result = original(self, *args, **kwargs)
 
-        if self.param_data is None:
-            return result
+        if not param_data_allocated or self.param_data is None:
+            raise RuntimeError("RCCL-SDMA direct gather did not allocate param_data")
         symmetric_memory = rendezvous_direct_param_buffer(self.param_data, group)
         # Keep the pool and rendezvous handle alive for the buffer lifetime.
         self._primus_rccl_sdma_pool = pool
@@ -237,6 +279,31 @@ def patch_rccl_sdma_param_all_gather(ctx: PatchContext) -> None:
     os.environ["NCCL_LOCAL_REGISTER"] = "0"
     os.environ["TORCH_NCCL_USE_TENSOR_REGISTER_ALLOCATOR_HOOK"] = "true"
 
+    eager_param_bytes = int(os.getenv("MEGATRON_RCCL_SDMA_EAGER_PARAM_BYTES", "0"))
+    if int(os.getenv("RANK", "0")) == 0:
+        print(
+            "[RCCL-SDMA:Megatron] eager direct configuration "
+            f"enabled={direct_param_gather_enabled()} bytes={eager_param_bytes}",
+            flush=True,
+        )
+    if direct_param_gather_enabled() and eager_param_bytes:
+        import torch.distributed._symmetric_memory as symm_mem
+
+        from primus.backends.megatron.core.distributed.rccl_sdma_param_gather import (
+            reserve_direct_param_buffer,
+        )
+
+        device = torch.device("cuda", int(os.getenv("LOCAL_RANK", torch.cuda.current_device())))
+        torch.cuda.set_device(device)
+        symm_mem.set_backend("NCCL")
+        pool = symm_mem.get_mem_pool(device)
+        reserve_direct_param_buffer(
+            None,
+            pool,
+            device,
+            eager_param_bytes,
+        )
+
     try:
         import megatron.core.distributed.param_and_grad_buffer as pgb
     except ImportError as exc:
@@ -270,22 +337,40 @@ def patch_rccl_sdma_param_all_gather(ctx: PatchContext) -> None:
 
     if os.getenv("MEGATRON_RCCL_SDMA_EAGER_INIT", "0") == "1":
         if not eager_initialize_runtime():
-            import megatron.training.initialize as init_module
+            import megatron.training.training as training_module
 
             eager_marker = "_primus_rccl_sdma_eager_init_patched"
-            if not getattr(init_module, eager_marker, False):
-                original_initialize_distributed = init_module._initialize_distributed
+            if not getattr(training_module, eager_marker, False):
+                original_initialize_megatron = training_module.initialize_megatron
 
-                def wrapped_initialize_distributed(*args, **kwargs):
-                    result = original_initialize_distributed(*args, **kwargs)
+                @functools.wraps(original_initialize_megatron)
+                def wrapped_initialize_megatron(*args, **kwargs):
+                    result = original_initialize_megatron(*args, **kwargs)
+                    if callable(result):
+                        deferred_initialize = result
+
+                        @functools.wraps(deferred_initialize)
+                        def wrapped_deferred_initialize(*deferred_args, **deferred_kwargs):
+                            deferred_result = deferred_initialize(
+                                *deferred_args,
+                                **deferred_kwargs,
+                            )
+                            if not eager_initialize_runtime():
+                                raise RuntimeError(
+                                    "torch.distributed is not initialized after "
+                                    "deferred Megatron initialization"
+                                )
+                            return deferred_result
+
+                        return wrapped_deferred_initialize
                     if not eager_initialize_runtime():
                         raise RuntimeError(
                             "torch.distributed is not initialized after "
-                            "Megatron distributed initialization"
+                            "Megatron initialization"
                         )
                     return result
 
-                init_module._initialize_distributed = wrapped_initialize_distributed
-                setattr(init_module, eager_marker, True)
+                training_module.initialize_megatron = wrapped_initialize_megatron
+                setattr(training_module, eager_marker, True)
 
     log_rank_0("[Patch:megatron.distributed.rccl_sdma_param_all_gather] installed")
