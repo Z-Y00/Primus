@@ -11,13 +11,18 @@ older base Triton for compatibility with the same Turbo branch.
 
 ```bash
 cd examples/mlperf/gpt_oss_20b
-./build_rccl_sdma_image.sh
+docker build \
+  --file Dockerfile.runtime-v26.5 \
+  --tag primus:gptoss-rccl-sdma-flydsl-v26.5 \
+  .
 ```
 
 The SDMA image defaults to Primus branch
-`feature/gptoss-rccl-sdma-flydsl` and Primus-Turbo commit
-`9c58dc318ed1780e55f9743cb410a1108b50ff29`. Override `IMAGE_TAG`,
-`PRIMUS_REF`, or `PRIMUS_TURBO_REF` when testing another revision.
+`feature/gptoss-rccl-sdma-flydsl-squashed` and Primus-Turbo commit
+`9c58dc318ed1780e55f9743cb410a1108b50ff29`. Pass
+`--build-arg PRIMUS_REF=<revision>` or
+`--build-arg PRIMUS_TURBO_REF=<revision>` before the final `.` when testing
+another revision, and select the output image name with `--tag`.
 
 Use `Dockerfile.runtime-v26.3` and a v26.3 tag for the compatibility stack.
 Push a shared tag with `docker push <image>`.
