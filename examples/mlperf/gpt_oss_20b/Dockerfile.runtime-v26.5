@@ -3,8 +3,10 @@
 ARG BASE_IMAGE=rocm/primus:v26.5@sha256:3040bf42974d791dd42de2e36b3c919a00869a5754cfc57a06b96d004c55eed1
 FROM ${BASE_IMAGE}
 
-ARG PRIMUS_REF=45a6f50e8160aaa55566449e4a5df3bd6e7cce7b
-ARG PRIMUS_TURBO_REF=2d31528d24b6f741193250199a083ce0fe7f943c
+ARG PRIMUS_REPO=https://github.com/Z-Y00/Primus.git
+ARG PRIMUS_REF=feature/gptoss-rccl-sdma-flydsl
+ARG PRIMUS_TURBO_REPO=https://github.com/AMD-AGI/Primus-Turbo.git
+ARG PRIMUS_TURBO_REF=9c58dc318ed1780e55f9743cb410a1108b50ff29
 ARG TE_REF=a07e607f14a5330807ffdafeeb6224f2d7dffacc
 ARG AITER_REF=d32b0cb62ecc32bb1a858e8437d58eb9b3856af6
 ARG FWD_ATTN_ASM_REF=53d3dadc3f3b0ac35ae536f2d1d7864a3e07ba22
@@ -22,7 +24,7 @@ ENV MLPERF_RUNTIME_SERIES=v26.5 \
 WORKDIR /workspace/deps
 
 # The v26.5 base already contains the tested Triton 3.7 compiler.
-RUN git clone --recursive https://github.com/AMD-AGI/Primus-Turbo.git && \
+RUN git clone --recursive "${PRIMUS_TURBO_REPO}" Primus-Turbo && \
     cd Primus-Turbo && git checkout "${PRIMUS_TURBO_REF}" && \
     git submodule update --init --recursive && \
     python3 -m pip install -r requirements.txt && \
@@ -95,7 +97,7 @@ RUN printf 'import aiter_hd64_asm_override\n' \
 # Install Primus.
 WORKDIR /workspace
 RUN rm -rf /workspace/Primus && \
-    git clone --recursive https://github.com/AMD-AGI/Primus.git Primus && \
+    git clone --recursive "${PRIMUS_REPO}" Primus && \
     cd Primus && git checkout "${PRIMUS_REF}" && \
     git submodule update --init --recursive && \
     rm -rf /root/.cache

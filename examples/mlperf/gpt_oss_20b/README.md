@@ -11,10 +11,13 @@ older base Triton for compatibility with the same Turbo branch.
 
 ```bash
 cd examples/mlperf/gpt_oss_20b
-docker build --network host \
-  -f Dockerfile.runtime-v26.5 \
-  -t primus:gpt-oss-20b-mlperf-v26.5 .
+./build_rccl_sdma_image.sh
 ```
+
+The SDMA image defaults to Primus branch
+`feature/gptoss-rccl-sdma-flydsl` and Primus-Turbo commit
+`9c58dc318ed1780e55f9743cb410a1108b50ff29`. Override `IMAGE_TAG`,
+`PRIMUS_REF`, or `PRIMUS_TURBO_REF` when testing another revision.
 
 Use `Dockerfile.runtime-v26.3` and a v26.3 tag for the compatibility stack.
 Push a shared tag with `docker push <image>`.
@@ -59,6 +62,17 @@ submission defaults: MLPerf trainer, 1.2M iteration ceiling, 128-step warmup,
 FP8 Triton grouped GEMM, fused wgrad accumulation, and disabled profiling.
 Short diagnostics and backend ablations should override environment variables
 outside the checked-in submission config.
+
+## SDMA RCCL
+For Docker launching, please raise `nofile` to 1,048,576. RCCL's extra
+communicator can exhaust Docker's default 1,024-descriptor soft limit and then
+block in `ncclOsSocketTryAccept`.
+
+Example config
+```
+   --ulimit memlock=-1:-1 \
+    --ulimit nofile=1048576:1048576 \
+```
 
 ## v26.5 attention prewarm
 

@@ -215,6 +215,10 @@ export MOE_SKIP_IDENTITY_SORT=1
 # -----------------------------------------------------------------------------
 # DDP Parameter All-Gather (SDMA)
 # -----------------------------------------------------------------------------
+# The real-data vocabulary produces a 41,817,339,648-byte parameter buffer.
+# Reserve the containing 2 MiB allocation class before model construction.
+export MEGATRON_RCCL_SDMA_EAGER_PARAM_BYTES="${MEGATRON_RCCL_SDMA_EAGER_PARAM_BYTES:-41819308032}"
+
 # v26.5 turns five SDMA workspace barriers into ~5 ms waits each. A same-node
 # A/B with the latest Turbo main measured 1004 ms/step with SDMA and 988
 # ms/step with RCCL, matching the v26.3 control at 989 ms/step. Keep SDMA
