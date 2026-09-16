@@ -86,8 +86,96 @@ bash examples/mlperf/gpt_oss_20b/run_with_docker.sh
 ```
 
 The launcher raises Docker's `nofile` limit for RCCL's dedicated parameter
-AllGather communicator. Gradient ReduceScatter and other collectives continue
-to use their original process groups.
+AllGather communicator.
+
+### Experimental RCCL SDMA gradient ReduceScatter
+
+Enable Megatron's AllToAll-plus-FP32-accumulation ReduceScatter through bounded
+RCCL copy-engine staging:
+
+```bash
+export MEGATRON_GRAD_REDUCE_BACKEND=rccl_sdma_a2a
+export PRIMUS_DDP_NUM_BUCKETS=50
+export MEGATRON_RCCL_SDMA_RS_STAGING_BYTES=536870912  # 512 MiB
+export MEGATRON_RCCL_SDMA_RS_WORKSPACE_DEPTH=2
+# Optional diagnostic: serialize A2A and local reduction (slower in GPT-OSS A/B).
+# export MEGATRON_RCCL_SDMA_RS_PIPELINE=0
+# Optional full-bucket path: use grad_data directly and one receive buffer.
+# export MEGATRON_RCCL_SDMA_RS_DIRECT_INPUT=1
+# export MEGATRON_RCCL_SDMA_RS_WORKSPACE_DEPTH=1
+# export MEGATRON_RCCL_SDMA_RS_STAGING_BYTES=1645805312
+bash examples/mlperf/gpt_oss_20b/run_with_docker.sh
+```
+
+The normal gradient input and optimizer output shard are unchanged. The
+`PRIMUS_DDP_NUM_BUCKETS=50` keeps gradient communication granular enough for
+backward overlap. The staging value is the AllToAll receive capacity per slot
+and rank. Each communicator/device/dtype owns a bounded ring of two workspaces
+by default. A workspace has two normal send buffers, two symmetric receive
+buffers, and a reduction stream. A fused Triton kernel accumulates in FP32
+registers and stores directly to Megatron's output shard. Streams are allocated
+at first use and checked against the caller and sibling workspace streams. The
+full chunk pipeline is queued eagerly at gradient-sync start; its work handle
+synchronizes the caller with a completion event. Within a bucket, the second
+AllToAll is queued before reducing the first chunk, allowing ProcessGroupNCCL's
+internal stream to overlap transport with reduction. Direct-input mode requires
+depth 1 and enough staging capacity for the largest complete bucket.
+
+The MI355X launcher defaults to
+`PYTORCH_ALLOC_CONF=expandable_segments:True` to avoid the fragmentation stall
+seen at MBS4; an explicit host value still overrides the default. This path
+supports BF16/FP16 transport, one
+distributed-optimizer instance, and one bucket per bucket group on a
+single-node job.
+
+Parameter and gradient SDMA can be enabled together by exporting both backend
+selectors. Do not set global `NCCL_CTA_POLICY` for either Megatron backend.
+
+### Final screened SDMA configuration
+
+The best profiled configuration on one MI355X node combines direct SDMA
+parameter AllGather with direct-input SDMA gradient ReduceScatter. The last two
+gradient buckets use native RCCL because their communication is exposed at the
+end of backward:
+
+```bash
+export GPU_MAX_HW_QUEUES=2
+export PYTORCH_ALLOC_CONF=expandable_segments:True
+export PRIMUS_DDP_NUM_BUCKETS=50
+
+export MEGATRON_PARAM_GATHER_BACKEND=rccl_sdma
+export MEGATRON_RCCL_SDMA_EAGER_INIT=1
+export MEGATRON_RCCL_SDMA_EAGER_PARAM_BYTES=41819308032
+# Allow rank-skew while a newly provisioned node compiles kernels.
+export MEGATRON_RCCL_SDMA_TIMEOUT_MINUTES=60
+
+export MEGATRON_GRAD_REDUCE_BACKEND=rccl_sdma_a2a
+export MEGATRON_RCCL_SDMA_RS_DIRECT_INPUT=1
+export MEGATRON_RCCL_SDMA_RS_STAGING_BYTES=1645805312
+export MEGATRON_RCCL_SDMA_RS_WORKSPACE_DEPTH=1
+export MEGATRON_RCCL_SDMA_RS_PIPELINE=1
+export MEGATRON_RCCL_SDMA_RS_NATIVE_TAIL=1
+export MEGATRON_RCCL_SDMA_RS_NATIVE_TAIL_BUCKETS=2
+
+# Requires Z-Y00/Primus-Turbo commit af66bdff.
+export PRIMUS_TURBO_ATTN_SINGLE_STREAM=1
+
+bash examples/mlperf/gpt_oss_20b/run_with_docker.sh
+```
+
+Matched profiler Step 3 screening results:
+
+- Direct input, Q2, two native tail buckets: **843.88 ms** (best).
+- Direct input, Q2, all SDMA buckets: 858.35 ms.
+- SDMA AllGather with native ReduceScatter and original Turbo: 866.23 ms.
+- 512 MiB two-slot pipelined staging, Q2: 891.82 ms.
+- Direct input, Q3, two native tail buckets: 893.05 ms.
+
+The winning trace contains 26 SDMA parameter AllGathers, 24 SDMA gradient
+AllToAlls, and two native tail ReduceScatters per step. Run at least three
+matched 50-step repetitions for this candidate and the native-RS/original-Turbo
+control after the MI355X test node is recovered; its ROCm management process
+entered uninterruptible kernel sleep after screening.
 
 ### MXFP4 recipe
 

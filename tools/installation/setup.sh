@@ -104,9 +104,9 @@ PRIMUS_REPO="https://github.com/AMD-AGI/Primus.git"
 PRIMUS_BRANCH="2aa05ead3401708cf1a1e2958c1def18d7aecf92"
 AITER_REPO="https://github.com/ROCm/aiter.git"
 AITER_COMMIT="0f3c58e6edb6754940bcf9fd5f09ccb6f389f52e"
-TURBO_REPO="https://github.com/AMD-AGI/Primus-Turbo.git"
-# Latest commit on `main` branch. Committed on 2026-08-21.
-TURBO_COMMIT="a6a16cdce46bd2235a248b41f501fb363c215b9b"
+TURBO_REPO="https://github.com/Z-Y00/Primus-Turbo.git"
+# Optional single-stream atomic-dQ backward, based on upstream main 9d160935.
+TURBO_COMMIT="af66bdff4df917f24e6dcfad8fd35534ca3a8211"
 # aiter pins `flydsl==0.1.7` and Primus-Turbo wants `flydsl>=0.2.0`, so one of
 # them is always unsatisfied; Turbo installs last and wins. aiter only needs
 # `flydsl.expr.vector` at runtime, which survived until 0.3.0 removed it -- and

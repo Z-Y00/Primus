@@ -38,7 +38,7 @@ def validate_global_cta_policy() -> None:
     global_policy = os.getenv("NCCL_CTA_POLICY")
     if global_policy:
         raise RuntimeError(
-            "MEGATRON_PARAM_GATHER_BACKEND=rccl_sdma requires "
+            "Megatron RCCL-SDMA requires "
             "NCCL_CTA_POLICY to be unset. A process-wide CTA policy is applied "
             "while every RCCL communicator is initialized and cannot be "
             "safely undone during the before_train patch phase."
@@ -62,8 +62,11 @@ def make_start_param_sync(original):
             self.param_gather_handle.wait()
             self.param_gather_handle = None
             return
-        if not force_sync:
-            assert self.param_gather_handle is None
+        if not force_sync and self.param_gather_handle is not None:
+            # Multiple parameter buckets from the same transformer layer can
+            # request the same look-ahead group before its first gather is
+            # consumed. The existing handle already represents that work.
+            return
 
         async_op = self.ddp_config.overlap_param_gather and not force_sync
         jobs = []

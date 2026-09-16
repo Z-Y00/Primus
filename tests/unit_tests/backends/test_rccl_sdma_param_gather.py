@@ -91,6 +91,23 @@ def test_direct_gather_uses_native_coalesced_work_handle(monkeypatch):
     assert bucket_group.param_gather_dispatched
 
 
+def test_duplicate_async_param_gather_start_is_idempotent():
+    existing_handle = object()
+    bucket_group = SimpleNamespace(
+        ddp_config=SimpleNamespace(use_distributed_optimizer=True),
+        param_gather_handle=existing_handle,
+    )
+    wrapped = rccl_sdma_param_all_gather_patches.make_start_param_sync(
+        lambda *_args, **_kwargs: pytest.fail(
+            "native Megatron fallback must not run"
+        )
+    )
+
+    wrapped(bucket_group)
+
+    assert bucket_group.param_gather_handle is existing_handle
+
+
 def test_direct_force_sync_uses_async_pg_stream_then_synchronizes(monkeypatch):
     monkeypatch.setenv("MEGATRON_PARAM_GATHER_BACKEND", "rccl_sdma")
 
@@ -532,6 +549,7 @@ def test_dedicated_group_gets_zero_cta_without_mutating_original(monkeypatch):
     assert captured["backend"] == "nccl"
     assert captured["pg_options"].config.cta_policy == 2
     assert captured["pg_options"].config.split_share == 0
+    assert captured["timeout"].total_seconds() == 600
     assert "PARAM_GATHER_POLICY_2" in captured["group_desc"]
     assert original_group.policy == "unchanged"
 
@@ -542,9 +560,15 @@ def _run_sdma_hook(extra_env, kernel_release="6.8.0"):
     for name in (
         "FSDP_ALL_GATHER_BACKEND",
         "MEGATRON_PARAM_GATHER_BACKEND",
+        "MEGATRON_GRAD_REDUCE_BACKEND",
         "MEGATRON_RCCL_SDMA_DIRECT",
         "MEGATRON_RCCL_SDMA_SCRATCH_BYTES",
         "MEGATRON_RCCL_SDMA_EAGER_INIT",
+        "MEGATRON_RCCL_SDMA_TIMEOUT_MINUTES",
+        "MEGATRON_RCCL_SDMA_RS_STAGING_BYTES",
+        "MEGATRON_RCCL_SDMA_RS_WORKSPACE_DEPTH",
+        "MEGATRON_RCCL_SDMA_RS_PIPELINE",
+        "MEGATRON_RCCL_SDMA_RS_DIRECT_INPUT",
         "NCCL_CTA_POLICY",
         "NCCL_CUMEM_ENABLE",
     ):
@@ -573,6 +597,7 @@ def _run_sdma_hook(extra_env, kernel_release="6.8.0"):
     [
         {"FSDP_ALL_GATHER_BACKEND": "rccl_sdma"},
         {"MEGATRON_PARAM_GATHER_BACKEND": "rccl_sdma"},
+        {"MEGATRON_GRAD_REDUCE_BACKEND": "rccl_sdma_a2a"},
     ],
 )
 def test_hook_rejects_kernel_older_than_6_8(backend):
@@ -593,6 +618,7 @@ def test_megatron_hook_enables_cumem_without_global_cta_policy():
     assert "env.NCCL_CTA_POLICY" not in result.stdout
     assert "env.NCCL_CUMEM_ENABLE=1" in result.stdout
     assert "env.MEGATRON_RCCL_SDMA_EAGER_INIT=1" in result.stdout
+    assert "env.MEGATRON_RCCL_SDMA_TIMEOUT_MINUTES=10" in result.stdout
     assert "MEGATRON_RCCL_SDMA_DIRECT" not in result.stdout
     assert "MEGATRON_RCCL_SDMA_SCRATCH_BYTES" not in result.stdout
 
@@ -607,11 +633,52 @@ def test_fsdp_hook_keeps_global_cumem_and_cta_policy():
     assert "env.NCCL_CTA_POLICY=2" in result.stdout
 
 
+def test_megatron_grad_hook_uses_per_group_cta_policy():
+    result = _run_sdma_hook(
+        {"MEGATRON_GRAD_REDUCE_BACKEND": "rccl_sdma_a2a"},
+    )
+
+    assert result.returncode == 0
+    assert "env.MEGATRON_GRAD_REDUCE_BACKEND=rccl_sdma_a2a" in result.stdout
+    assert "env.MEGATRON_RCCL_SDMA_CTA_POLICY=2" in result.stdout
+    assert "env.MEGATRON_RCCL_SDMA_RS_STAGING_BYTES=536870912" in result.stdout
+    assert "env.MEGATRON_RCCL_SDMA_RS_WORKSPACE_DEPTH=2" in result.stdout
+    assert "env.MEGATRON_RCCL_SDMA_RS_PIPELINE=1" in result.stdout
+    assert "env.MEGATRON_RCCL_SDMA_RS_DIRECT_INPUT=0" in result.stdout
+    assert "env.NCCL_CTA_POLICY" not in result.stdout
+
+
+def test_param_and_grad_sdma_backends_can_be_combined():
+    result = _run_sdma_hook(
+        {
+            "MEGATRON_PARAM_GATHER_BACKEND": "rccl_sdma",
+            "MEGATRON_GRAD_REDUCE_BACKEND": "rccl_sdma_a2a",
+        },
+    )
+
+    assert result.returncode == 0
+    assert "env.MEGATRON_PARAM_GATHER_BACKEND=rccl_sdma" in result.stdout
+    assert "env.MEGATRON_GRAD_REDUCE_BACKEND=rccl_sdma_a2a" in result.stdout
+    assert result.stdout.count("env.MEGATRON_RCCL_SDMA_CTA_POLICY=2") == 1
+
+
 def test_hook_rejects_combined_fsdp_and_megatron_backends():
     result = _run_sdma_hook(
         {
             "FSDP_ALL_GATHER_BACKEND": "rccl_sdma",
             "MEGATRON_PARAM_GATHER_BACKEND": "rccl_sdma",
+        },
+    )
+
+    assert result.returncode == 2
+    assert "cannot be enabled together" in result.stderr
+
+
+def test_hook_rejects_combined_fsdp_and_megatron_grad_backend():
+    result = _run_sdma_hook(
+        {
+            "FSDP_ALL_GATHER_BACKEND": "rccl_sdma",
+            "MEGATRON_GRAD_REDUCE_BACKEND": "rccl_sdma_a2a",
         },
     )
 

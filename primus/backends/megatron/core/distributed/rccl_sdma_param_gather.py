@@ -8,14 +8,15 @@
 
 Megatron's parameter buffer is allocated from PyTorch NCCL symmetric memory
 and gathered in place through a dedicated zero-CTA ProcessGroupNCCL
-communicator. Gradient ReduceScatter and all other collectives retain their
-original process groups.
+communicator. Other collectives retain their original process groups unless
+their own explicitly selected backend replaces them.
 """
 
 from __future__ import annotations
 
 import math
 import os
+from datetime import timedelta
 
 import torch
 import torch.distributed as dist
@@ -43,7 +44,7 @@ def recommended_eager_param_bytes(size_bytes: int) -> int:
 def get_sdma_process_group(
     original_group: dist.ProcessGroup,
 ) -> dist.ProcessGroup:
-    """Create one full-rank communicator used only for zero-CTA AllGather."""
+    """Create one full-rank communicator for Megatron zero-CTA collectives."""
     global _SDMA_GROUP
 
     if original_group.size() != dist.get_world_size():
@@ -71,6 +72,11 @@ def get_sdma_process_group(
             ranks=list(range(dist.get_world_size())),
             backend="nccl",
             pg_options=options,
+            timeout=timedelta(
+                minutes=int(
+                    os.getenv("MEGATRON_RCCL_SDMA_TIMEOUT_MINUTES", "10")
+                )
+            ),
             group_desc=f"MEGATRON_RCCL_SDMA_PARAM_GATHER_POLICY_{cta_policy}",
         )
         if dist.get_rank() == 0:

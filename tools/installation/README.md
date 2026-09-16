@@ -167,8 +167,9 @@ The order matters for `te`: see the note on the staging index below.
 - **mamba** applies the v26.6 `uninitialized_copy.cuh` CUDA-namespace patches
   and installs `nvidia-cuda-nvdisasm==13.3.73`.
 - **Updated pins:** torch `2.12.0+rocm7.15.0a20260727`, TE 2.17, transformers
-  `5.5.0`, wandb `0.28.2`, Primus `2aa05ead…` (`release/v26.6`), Primus-Turbo
-  `a6a16cdc…`. CVE pins: `cryptography==50.0.0`, `mlflow==3.15.1` (`--no-deps`).
+  `5.5.0`, wandb `0.28.2`, Primus `2aa05ead…` (`release/v26.6`), and the
+  `Z-Y00/Primus-Turbo` single-stream branch at `af66bdff…`. CVE pins:
+  `cryptography==50.0.0`, `mlflow==3.15.1` (`--no-deps`).
 - **`ck_jit_compile.sh` is still patched** the same way the image patches it.
 - **`GPU_ARCHS` remains `native` at runtime.** `setup.sh` still overrides it to
   the full arch list for stages that cross-compile.

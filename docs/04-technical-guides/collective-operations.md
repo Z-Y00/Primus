@@ -231,6 +231,69 @@ first attempts allocation after Megatron calculates the exact buffer size. If
 that fails, rerun with the `MEGATRON_RCCL_SDMA_EAGER_PARAM_BYTES` value printed
 in the error so the same buffer is reserved before model construction.
 
+### Megatron gradient ReduceScatter with RCCL DMA
+
+Megatron already provides an optional ReduceScatter decomposition that
+transports gradients with AllToAll and accumulates the received contributions
+locally in FP32. The implementation was introduced by Deepak Narayanan in
+[Megatron-LM PR #1967](https://github.com/NVIDIA/Megatron-LM/pull/1967).
+
+Primus can route that AllToAll through a same-node zero-CTA RCCL process group
+and bound its temporary memory with chunked symmetric receive staging:
+
+```bash
+export MEGATRON_GRAD_REDUCE_BACKEND=rccl_sdma_a2a
+export PRIMUS_DDP_NUM_BUCKETS=50
+export MEGATRON_RCCL_SDMA_RS_STAGING_BYTES=536870912
+export MEGATRON_RCCL_SDMA_RS_WORKSPACE_DEPTH=2
+unset NCCL_CTA_POLICY
+
+bash examples/mlperf/gpt_oss_20b/run_with_docker.sh
+```
+
+The original gradient buffer and optimizer-owned output shard remain normal
+Megatron tensors. Each chunk is packed into normal send staging and received
+into symmetric staging by RCCL AllToAll. A fused Triton kernel accumulates in
+FP32 registers and stores directly into the original output shard. Each
+workspace owns a reduction stream that is allocated at first use and guaranteed
+distinct from the caller and sibling workspace streams. Gradient-sync start
+eagerly queues the complete chunk pipeline; the
+returned handle makes the caller wait on a completion event. A
+communicator/device/dtype shares a bounded ring of two-slot workspaces across
+gradient buckets. Within a bucket, the second slot queues the next AllToAll
+before reducing the current chunk so RCCL's internal stream can overlap
+transfer with FP32 accumulation. `SUM` and `AVG` are supported for BF16 and
+FP16 gradient transport.
+
+This backend is opt-in and currently supports single-node jobs with one
+distributed-optimizer instance and one bucket per bucket group. Parameter
+AllGather SDMA and gradient ReduceScatter SDMA may be enabled together because
+they use per-group CTA policy; neither may be combined with the FSDP backend
+that sets `NCCL_CTA_POLICY=2` process-wide.
+
+The default staging cap is 512 MiB per slot. Per-bucket workspaces made large
+staging impractical; the depth-two ring bounds the total to 4 GiB for BF16 or
+FP16 regardless of the gradient bucket count. For GPT-OSS-20B with a 50-bucket
+target, this reduces the runtime pipeline from about 330 to 101 chunks per
+step.
+
+When a complete bucket fits in one allocation, direct-input mode removes send
+staging and double buffering:
+
+```bash
+export MEGATRON_RCCL_SDMA_RS_DIRECT_INPUT=1
+export MEGATRON_RCCL_SDMA_RS_WORKSPACE_DEPTH=1
+export MEGATRON_RCCL_SDMA_RS_STAGING_BYTES=1645805312
+```
+
+The receive buffer is reserved before model construction. GPT-OSS then issues
+one AllToAll per each of its 26 realized buckets and uses about 1.53 GiB of
+workspace.
+
+Native RCCL ReduceScatter remains the latency baseline. This path targets
+compute-unit offload and bounded temporary memory, and must be evaluated in
+end-to-end overlap rather than enabled by default.
+
 
 ### Environment variables
 
