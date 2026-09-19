@@ -107,6 +107,62 @@ class FSDP2Trainer(BaseWanTrainer):
 
         self._apply_fsdp2()
 
+    def _sdma_all_gather_enabled(self) -> bool:
+        """RCCL copy-engine AllGather is opt-in via the hook's FSDP selector.
+
+        ``runner/helpers/hooks/06_enable_sdma_all_gather.sh`` validates the
+        kernel, exports the zero-CTA env, and propagates this variable into the
+        torchrun children, so no YAML change is needed to opt in.
+        """
+        return os.getenv("FSDP_ALL_GATHER_BACKEND", "") == "rccl_sdma"
+
+    def _maybe_attach_sdma_all_gather(self, module) -> None:
+        """Route a fully_shard'd module's AllGather through symmetric memory.
+
+        ``SymmMemAllGather`` backs the gather with a cuMem buffer that RCCL
+        recognizes as eligible for the copy-engine dispatch path. ReduceScatter
+        is left on the FSDP default.
+        """
+        if not self._sdma_all_gather_enabled():
+            return
+
+        from torch.distributed.fsdp._fully_shard._fsdp_collectives import (
+            SymmMemAllGather,
+        )
+
+        log_attachments = os.getenv("SDMA_ALL_GATHER_LOG", "0") == "1"
+
+        try:
+            state = module._get_fsdp_state()
+        except Exception:
+            return
+
+        # set_custom_all_gather rejects modules whose parameters span more than
+        # one group (e.g. a per-parameter mesh via shard_placement_fn); leave
+        # those on whatever collective FSDP picked.
+        groups = getattr(state, "_fsdp_param_groups", None) or []
+        if len(groups) != 1:
+            if log_attachments and self.rank == 0:
+                logger.warning(
+                    f"FSDP2/SDMA: skipping {type(module).__name__}: "
+                    f"expected one parameter group, found {len(groups)}"
+                )
+            return
+
+        process_group = groups[0]._all_gather_process_group
+        try:
+            module.set_custom_all_gather(SymmMemAllGather(process_group, "NCCL"))
+        except (AttributeError, ValueError, AssertionError) as error:
+            if self.rank == 0:
+                logger.warning(f"FSDP2/SDMA: failed to attach to {type(module).__name__}: {error}")
+            return
+
+        if log_attachments and self.rank == 0:
+            logger.info(
+                f"FSDP2/SDMA: attached SymmMemAllGather to {type(module).__name__} "
+                f"(group={process_group.group_name})"
+            )
+
     def _apply_fsdp2(self):
         """Apply torch.distributed._composable.fsdp.fully_shard to the model."""
         mp_dtype = self._resolve_dtype()
@@ -176,6 +232,7 @@ class FSDP2Trainer(BaseWanTrainer):
                 reshard_after_forward=False if module_path in no_reshard_paths else reshard_after_forward,
                 mp_policy=mp_policy,
             )
+            self._maybe_attach_sdma_all_gather(module)
             wrapped_paths += 1
         if self.rank == 0 and wrapped_paths:
             logger.info(
@@ -218,6 +275,7 @@ class FSDP2Trainer(BaseWanTrainer):
                         reshard_after_forward=reshard_after_forward,
                         mp_policy=mp_policy,
                     )
+                    self._maybe_attach_sdma_all_gather(module)
                     if checkpointed_module is not None:
                         seen.add(id(checkpointed_module))
                     wrapped_count += 1
@@ -231,6 +289,7 @@ class FSDP2Trainer(BaseWanTrainer):
             reshard_after_forward=reshard_after_forward,
             mp_policy=mp_policy,
         )
+        self._maybe_attach_sdma_all_gather(wrap_root)
         if self.rank == 0:
             logger.info(
                 f"FSDP2: applied fully_shard to '{wrap_target or '<model>'}' "
