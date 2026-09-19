@@ -11,8 +11,16 @@ from primus.backends.diffusion.data.flux_precomputed import (
     FluxPrecomputedProcessor,
     FluxRawImageTextDataset,
     FluxRawImageTextProcessor,
+    FluxSyntheticPrecomputedDataset,
 )
 from primus.backends.diffusion.utils.log import logger
+
+_SYNTHETIC_BANNER = (
+    "SYNTHETIC FLUX DATA (dataset_type=synthetic): encodings are random tensors, "
+    "not real preprocessed samples. Throughput, memory and collective behaviour "
+    "are valid; loss and convergence are MEANINGLESS and must never be reported "
+    "as a training result."
+)
 
 
 def _build_flux_dataset_from_config(dataset_config: dict, *, role: str):
@@ -36,8 +44,30 @@ def _build_flux_dataset_from_config(dataset_config: dict, *, role: str):
             require_timestep=role == "eval",
         )
         logger.info(f"Built FLUX {role} precomputed dataset with {len(dataset)} samples")
+    elif dataset_type == "synthetic":
+        # Prompt dropout would need a real empty-encodings file on disk, which
+        # defeats the point of a no-dataset run; random prompts are already
+        # meaningless, so drop it rather than demand the file.
+        synthetic_processor_config = dict(processor_config)
+        synthetic_processor_config["prompt_dropout_prob"] = 0.0
+        processor = FluxPrecomputedProcessor(synthetic_processor_config)
+        processor.build()
+        dataset = FluxSyntheticPrecomputedDataset(
+            num_samples=int(dataset_config.get("num_samples") or 256),
+            img_size=int(synthetic_processor_config.get("img_size") or 256),
+            require_timestep=role == "eval",
+        )
+        # Loud and unconditional: a synthetic run must never be mistaken for a
+        # real one when someone reads the log later.
+        logger.warning("=" * 100)
+        logger.warning(_SYNTHETIC_BANNER)
+        logger.warning(
+            f"Built FLUX {role} SYNTHETIC dataset with {len(dataset)} samples "
+            f"(t5={dataset.t5_shape}, clip={dataset.clip_shape}, latent={dataset.latent_shape})"
+        )
+        logger.warning("=" * 100)
     else:
-        raise ValueError("FLUX dataset_type must be either 'precomputed' or 'raw'")
+        raise ValueError("FLUX dataset_type must be one of: 'precomputed', 'raw', 'synthetic'")
     return dataset, processor
 
 

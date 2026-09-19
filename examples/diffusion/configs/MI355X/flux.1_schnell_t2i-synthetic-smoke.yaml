@@ -1,0 +1,49 @@
+# FLUX.1-Schnell smoke config backed by synthetic encodings -- no dataset on
+# disk. Use for throughput / collective work (e.g. SDMA all-gather); loss from
+# this config is meaningless.
+work_group: ${PRIMUS_TEAM:local}
+user_name: ${PRIMUS_USER:local}
+exp_name: ${PRIMUS_EXP_NAME:flux.1_schnell_t2i-synthetic-smoke}
+workspace: ${PRIMUS_WORKSPACE:./output}
+
+platform:
+  config: platform_local.yaml
+
+modules:
+  pre_trainer:
+    framework: diffusion
+    config: pre_trainer.yaml
+    model: flux.1_schnell_t2i.yaml
+    overrides:
+      metrics:
+        log_freq: ${LOG_FREQ:10}
+        enable_wandb: false
+
+      training:
+        local_batch_size: ${LOCAL_BATCH_SIZE:2}
+        steps: ${MAX_STEPS:50}
+        num_train_epochs: 1000
+        gradient_accumulation_steps: 1
+        output_dir: ${OUTPUT_DIR:./output/flux-synthetic-smoke}
+        save_steps: 0
+        save_strategy: none
+        resume_from_checkpoint: ""
+        run_name: flux-synthetic-smoke
+
+      data:
+        dataset_type: synthetic
+        num_samples: ${NUM_SAMPLES:256}
+        img_size: ${IMG_SIZE:256}
+
+      parallelism:
+        sp_size: 1
+        dp_replicate: ${DP_REPLICATE:1}
+
+      runtime:
+        seed: ${SEED:10007}
+        attention_backend: ${ATTENTION_BACKEND:flash_attn_aiter}
+        gradient_checkpointing: ${GRADIENT_CHECKPOINTING:true}
+        gradient_checkpointing_ratio: ${GRADIENT_CHECKPOINTING_RATIO:0.25}
+        compile_transformer_blocks: ${COMPILE_TRANSFORMER_BLOCKS:false}
+        fsdp2_reshard_after_forward: ${FSDP2_RESHARD_AFTER_FORWARD:true}
+        report_to: none

@@ -32,6 +32,7 @@ class DatasetConfig(Args):
 
     # Dataset configuration
     dataset_path: str | None = None  # Optional - used for external files
+    num_samples: int | None = None  # Only used by dataset_type=synthetic
     datasets: list[dict] | None = None  # Optional - used for inline YAML definitions
     shuffle: bool = True
     data_seed: int | None = 42

@@ -300,6 +300,7 @@ class DiffusionArgBuilder:
             ("dataset_format",): ("dataset_format",),
             ("dataset_type",): ("dataset_type",),
             ("dataset",): ("dataset",),
+            ("num_samples",): ("num_samples",),
             ("shuffle",): ("shuffle",),
             ("empty_encodings_path",): ("processor_config", "empty_encodings_path"),
             ("prompt_dropout_prob",): ("processor_config", "prompt_dropout_prob"),

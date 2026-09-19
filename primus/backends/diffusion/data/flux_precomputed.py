@@ -92,6 +92,71 @@ class FluxPrecomputedDataset(Dataset):
         return RawBatchCollator()
 
 
+class FluxSyntheticPrecomputedDataset(Dataset):
+    """Random stand-in for precomputed FLUX encodings, generated on the fly.
+
+    Emits the same field names, shapes and dtypes as FluxPrecomputedDataset, so
+    the collator, processor and train pipeline downstream are the real ones --
+    only the bytes are fake. Intended for throughput, scaling and collective
+    benchmarking where the MLPerf preprocessed dataset is unavailable.
+
+    Samples are generated per __getitem__ from a per-index seed rather than
+    materialized up front: identical across ranks and epochs, with no disk use
+    and no memory that grows with num_samples.
+
+    Loss from this data is meaningless -- see the warning logged at build time.
+    """
+
+    def __init__(
+        self,
+        *,
+        num_samples: int = 256,
+        img_size: int = 256,
+        t5_length: int = 256,
+        t5_dim: int = 4096,
+        clip_dim: int = 768,
+        latent_channels: int = 16,
+        vae_scale_factor: int = 8,
+        seed: int = 0,
+        require_timestep: bool = False,
+    ):
+        if num_samples <= 0:
+            raise ValueError(f"Synthetic FLUX dataset requires num_samples > 0, got {num_samples}.")
+        if img_size % vae_scale_factor != 0:
+            raise ValueError(
+                f"Synthetic FLUX img_size={img_size} must be divisible by "
+                f"vae_scale_factor={vae_scale_factor}."
+            )
+        self.num_samples = int(num_samples)
+        self.t5_shape = (int(t5_length), int(t5_dim))
+        self.clip_shape = (int(clip_dim),)
+        latent_hw = img_size // vae_scale_factor
+        self.latent_shape = (int(latent_channels), latent_hw, latent_hw)
+        self.seed = int(seed)
+        self.require_timestep = require_timestep
+
+    def __len__(self) -> int:
+        return self.num_samples
+
+    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
+        if not 0 <= idx < self.num_samples:
+            raise IndexError(idx)
+        generator = torch.Generator().manual_seed(self.seed * 1_000_003 + idx)
+        sample = {
+            "t5_encodings": torch.randn(self.t5_shape, generator=generator),
+            "clip_encodings": torch.randn(self.clip_shape, generator=generator),
+            "mean": torch.randn(self.latent_shape, generator=generator),
+            # Keep log-variance near zero so the sampled latent stays well scaled.
+            "logvar": torch.randn(self.latent_shape, generator=generator) * 0.1 - 1.0,
+        }
+        if self.require_timestep:
+            sample["timestep"] = torch.randint(0, 8, (1,), generator=generator, dtype=torch.int64)
+        return sample
+
+    def get_collator(self):
+        return RawBatchCollator()
+
+
 class FluxRawImageTextDataset(Dataset):
     """Map-style raw image-text dataset for online FLUX encoding."""
 
