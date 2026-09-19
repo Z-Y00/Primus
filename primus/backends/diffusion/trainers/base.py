@@ -17,7 +17,7 @@ from __future__ import annotations
 import math
 import os
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 
 import torch
 from torch.utils.data import Sampler
@@ -831,6 +831,40 @@ class BaseWanTrainer:
                 payload["time/eta_s"] = eta_seconds
             wandb.log(payload, step=self.global_step)
 
+    def _make_profiler(self):
+        """Optional torch profiler around the update loop, gated on PRIMUS_PROFILE=1.
+
+        Profiles a window well after startup so the trace shows steady-state
+        steps rather than warmup. Defaults to rank 0 only, since a full trace
+        per rank is large and the collective pattern is symmetric.
+        """
+        if os.getenv("PRIMUS_PROFILE", "0") != "1":
+            return nullcontext()
+
+        ranks = os.getenv("PRIMUS_PROFILE_RANKS", "0").strip()
+        if ranks != "all":
+            selected = {int(r) for r in ranks.split(",") if r.strip()}
+            if self.rank not in selected:
+                return nullcontext()
+
+        out_dir = os.getenv("PRIMUS_PROFILE_DIR", "") or os.path.join(self.output_dir, "profile")
+        os.makedirs(out_dir, exist_ok=True)
+        logger.info(f"Profiler enabled on rank {self.rank}; traces -> {out_dir}")
+
+        return torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+            schedule=torch.profiler.schedule(
+                wait=int(os.getenv("PRIMUS_PROFILE_WAIT", "30")),
+                warmup=int(os.getenv("PRIMUS_PROFILE_WARMUP", "3")),
+                active=int(os.getenv("PRIMUS_PROFILE_ACTIVE", "5")),
+                repeat=1,
+            ),
+            on_trace_ready=torch.profiler.tensorboard_trace_handler(out_dir),
+        )
+
     def train(self):
         if self.rank == 0:
             logger.info("Starting training...")
@@ -858,138 +892,144 @@ class BaseWanTrainer:
         start_epoch = self.global_step // steps_per_epoch
         resume_batch_offset = (self.global_step % steps_per_epoch) * self.grad_accum_steps
 
-        for epoch in range(start_epoch, self.num_train_epochs):
-            self.sampler.set_epoch(epoch)
-            if isinstance(self.sampler, ContiguousDistributedSampler):
-                sample_offset = (
-                    resume_batch_offset * self.per_device_train_batch_size if epoch == start_epoch else 0
-                )
-                self.sampler.set_offset(sample_offset)
-
-            for batch_idx, batch in enumerate(self.dataloader):
-                if self.rank == 0 and self.global_step == 0 and batch_idx == 0:
-                    logger.info("First training batch loaded; entering forward pass")
-                if self.mlperf_enabled and not mlperf_train_started:
-                    self._mlperf_log_train_start()
-                    mlperf_train_started = True
-                is_update_step = ((batch_idx + 1) % max(1, self.grad_accum_steps)) == 0
-                local_samples_in_update += self._infer_local_batch_size(batch)
-                if is_update_step:
-                    self._mlperf_log_block_start(self.global_step + 1)
-
-                with self._grad_sync_context(is_update_step):
-                    try:
-                        raw_loss = self.compute_loss(batch)
-                    except BaseException as exc:
-                        logger.exception(
-                            "Training forward failed at step %d, batch %d: %r",
-                            self.global_step,
-                            batch_idx,
-                            exc,
-                        )
-                        raise
-                    if self.rank == 0 and self.global_step == 0 and batch_idx == 0:
-                        logger.info("First training forward completed; entering backward pass")
-                    detached_loss = raw_loss.detach().float()
-                    update_loss_sum = (
-                        detached_loss if update_loss_sum is None else update_loss_sum + detached_loss
+        with self._make_profiler() as profiler:
+            for epoch in range(start_epoch, self.num_train_epochs):
+                self.sampler.set_epoch(epoch)
+                if isinstance(self.sampler, ContiguousDistributedSampler):
+                    sample_offset = (
+                        resume_batch_offset * self.per_device_train_batch_size if epoch == start_epoch else 0
                     )
-                    update_loss_count += 1
-                    loss = raw_loss / max(1, self.grad_accum_steps)
-                    loss.backward()
+                    self.sampler.set_offset(sample_offset)
+
+                for batch_idx, batch in enumerate(self.dataloader):
                     if self.rank == 0 and self.global_step == 0 and batch_idx == 0:
-                        logger.info("First training backward completed")
+                        logger.info("First training batch loaded; entering forward pass")
+                    if self.mlperf_enabled and not mlperf_train_started:
+                        self._mlperf_log_train_start()
+                        mlperf_train_started = True
+                    is_update_step = ((batch_idx + 1) % max(1, self.grad_accum_steps)) == 0
+                    local_samples_in_update += self._infer_local_batch_size(batch)
+                    if is_update_step:
+                        self._mlperf_log_block_start(self.global_step + 1)
 
-                if is_update_step:
-                    loss_val = update_loss_sum / max(1, update_loss_count)
-                    update_loss_sum = None
-                    update_loss_count = 0
-                    grad_norm = self._clip_grad_norm()
-
-                    self.optimizer.step()
-                    self.lr_scheduler.step()
-                    self.optimizer.zero_grad(set_to_none=True)
-                    self.global_step += 1
-                    self._mlperf_log_block_stop(self.global_step)
-                    update_steps_since_log += 1
-                    local_samples_since_log += local_samples_in_update
-                    local_samples_in_update = 0
-
-                    # Logging
-                    if self.global_step % self.logging_steps == 0:
-                        now = time.time()
-                        log_interval = now - last_log_time
-                        step_time = log_interval / max(1, update_steps_since_log)
-                        last_log_time = now
-                        elapsed = now - start_time
-                        steps_left = max(0, self.total_steps - self.global_step)
-                        eta_seconds = step_time * steps_left
-                        throughput_samples_per_gpu_s = self._compute_samples_per_gpu_per_second(
-                            local_samples=local_samples_since_log,
-                            interval_seconds=log_interval,
-                        )
-                        self._log_step(
-                            loss_val,
-                            grad_norm=grad_norm,
-                            step_time=step_time,
-                            elapsed=elapsed,
-                            eta_seconds=eta_seconds,
-                            throughput_samples_per_gpu_s=throughput_samples_per_gpu_s,
-                        )
-                        local_samples_since_log = 0
-                        update_steps_since_log = 0
-
-                    # Periodic save
-                    if self.save_steps > 0 and self.global_step % self.save_steps == 0:
-                        self._save_checkpoint()
-
-                    if self.mlperf_enabled and self.global_step % self.mlperf_eval_freq_steps == 0:
-                        self._mlperf_log_eval_start()
-                        val_loss = self.validate_loss()
-                        self._mlperf_log_eval_stop(val_loss)
-                        if self.rank == 0:
-                            logger.info(
-                                f"mlperf_validation step={self.global_step} "
-                                f"loss={val_loss:.6f} target={self.mlperf_target_eval_loss:.6f}"
+                    with self._grad_sync_context(is_update_step):
+                        try:
+                            raw_loss = self.compute_loss(batch)
+                        except BaseException as exc:
+                            logger.exception(
+                                "Training forward failed at step %d, batch %d: %r",
+                                self.global_step,
+                                batch_idx,
+                                exc,
                             )
-                            if self.use_wandb:
-                                payload = {
-                                    "val/loss": val_loss,
-                                    "validation_metrics/loss": val_loss,
-                                    "validation_metrics/loss_vs_samples": val_loss,
-                                    "validation_metrics/samples_count": (
-                                        self.global_step * self._global_batch_size()
-                                    ),
-                                }
-                                if val_loss <= self.mlperf_target_eval_loss and self.mlperf_train_start_time:
-                                    payload["time_metrics/time_to_converge(s)"] = (
-                                        time.time() - self.mlperf_train_start_time
-                                    )
-                                wandb.log(payload, step=self.global_step)
-                        if val_loss <= self.mlperf_target_eval_loss:
-                            self.mlperf_run_success = True
-                            if self.rank == 0 and self.mlperf_train_start_time:
-                                time_to_converge = time.time() - self.mlperf_train_start_time
+                            raise
+                        if self.rank == 0 and self.global_step == 0 and batch_idx == 0:
+                            logger.info("First training forward completed; entering backward pass")
+                        detached_loss = raw_loss.detach().float()
+                        update_loss_sum = (
+                            detached_loss if update_loss_sum is None else update_loss_sum + detached_loss
+                        )
+                        update_loss_count += 1
+                        loss = raw_loss / max(1, self.grad_accum_steps)
+                        loss.backward()
+                        if self.rank == 0 and self.global_step == 0 and batch_idx == 0:
+                            logger.info("First training backward completed")
+
+                    if is_update_step:
+                        loss_val = update_loss_sum / max(1, update_loss_count)
+                        update_loss_sum = None
+                        update_loss_count = 0
+                        grad_norm = self._clip_grad_norm()
+
+                        self.optimizer.step()
+                        self.lr_scheduler.step()
+                        self.optimizer.zero_grad(set_to_none=True)
+                        self.global_step += 1
+                        if profiler is not None:
+                            profiler.step()
+                        self._mlperf_log_block_stop(self.global_step)
+                        update_steps_since_log += 1
+                        local_samples_since_log += local_samples_in_update
+                        local_samples_in_update = 0
+
+                        # Logging
+                        if self.global_step % self.logging_steps == 0:
+                            now = time.time()
+                            log_interval = now - last_log_time
+                            step_time = log_interval / max(1, update_steps_since_log)
+                            last_log_time = now
+                            elapsed = now - start_time
+                            steps_left = max(0, self.total_steps - self.global_step)
+                            eta_seconds = step_time * steps_left
+                            throughput_samples_per_gpu_s = self._compute_samples_per_gpu_per_second(
+                                local_samples=local_samples_since_log,
+                                interval_seconds=log_interval,
+                            )
+                            self._log_step(
+                                loss_val,
+                                grad_norm=grad_norm,
+                                step_time=step_time,
+                                elapsed=elapsed,
+                                eta_seconds=eta_seconds,
+                                throughput_samples_per_gpu_s=throughput_samples_per_gpu_s,
+                            )
+                            local_samples_since_log = 0
+                            update_steps_since_log = 0
+
+                        # Periodic save
+                        if self.save_steps > 0 and self.global_step % self.save_steps == 0:
+                            self._save_checkpoint()
+
+                        if self.mlperf_enabled and self.global_step % self.mlperf_eval_freq_steps == 0:
+                            self._mlperf_log_eval_start()
+                            val_loss = self.validate_loss()
+                            self._mlperf_log_eval_stop(val_loss)
+                            if self.rank == 0:
                                 logger.info(
-                                    "MLPerf target reached: "
-                                    f"validation_loss={val_loss:.6f}, "
-                                    f"time_to_converge_s={time_to_converge:.2f}"
+                                    f"mlperf_validation step={self.global_step} "
+                                    f"loss={val_loss:.6f} target={self.mlperf_target_eval_loss:.6f}"
                                 )
-                                if self.mlperf_logger is not None:
-                                    self.mlperf_logger.event(
-                                        key="time_metrics/time_to_converge(s)",
-                                        value=time_to_converge,
+                                if self.use_wandb:
+                                    payload = {
+                                        "val/loss": val_loss,
+                                        "validation_metrics/loss": val_loss,
+                                        "validation_metrics/loss_vs_samples": val_loss,
+                                        "validation_metrics/samples_count": (
+                                            self.global_step * self._global_batch_size()
+                                        ),
+                                    }
+                                    if (
+                                        val_loss <= self.mlperf_target_eval_loss
+                                        and self.mlperf_train_start_time
+                                    ):
+                                        payload["time_metrics/time_to_converge(s)"] = (
+                                            time.time() - self.mlperf_train_start_time
+                                        )
+                                    wandb.log(payload, step=self.global_step)
+                            if val_loss <= self.mlperf_target_eval_loss:
+                                self.mlperf_run_success = True
+                                if self.rank == 0 and self.mlperf_train_start_time:
+                                    time_to_converge = time.time() - self.mlperf_train_start_time
+                                    logger.info(
+                                        "MLPerf target reached: "
+                                        f"validation_loss={val_loss:.6f}, "
+                                        f"time_to_converge_s={time_to_converge:.2f}"
                                     )
+                                    if self.mlperf_logger is not None:
+                                        self.mlperf_logger.event(
+                                            key="time_metrics/time_to_converge(s)",
+                                            value=time_to_converge,
+                                        )
+                                self._mlperf_log_run_stop()
+                                return
+
+                        # Early termination
+                        if self.max_steps > 0 and self.global_step >= self.max_steps:
                             self._mlperf_log_run_stop()
                             return
 
-                    # Early termination
-                    if self.max_steps > 0 and self.global_step >= self.max_steps:
-                        self._mlperf_log_run_stop()
-                        return
-
-            if self.max_steps > 0 and self.global_step >= self.max_steps:
-                break
+                if self.max_steps > 0 and self.global_step >= self.max_steps:
+                    break
 
         if self.rank == 0:
             elapsed = time.time() - start_time
