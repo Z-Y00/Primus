@@ -269,12 +269,12 @@ def make_param_and_grad_buffer_init(original):
         param_data_allocated = False
         grad_data_allocated = False
 
-        def allocate_from_pool(kind: str, env_var: str, zeros_args, zeros_kwargs):
+        def allocate_from_pool(kind: str, role: str, env_var: str, zeros_args, zeros_kwargs):
             """Allocate a direct buffer, reusing an eager reservation if one matches."""
             dtype = zeros_kwargs.get("dtype")
             if dtype is None:
                 raise RuntimeError(f"RCCL-SDMA direct {kind} allocation requires an explicit dtype")
-            eager_tensor = take_direct_param_buffer(group, device, zeros_args[0], dtype)
+            eager_tensor = take_direct_param_buffer(group, device, zeros_args[0], dtype, role=role)
             if eager_tensor is not None:
                 return eager_tensor
             numel = int(zeros_args[0])
@@ -301,6 +301,7 @@ def make_param_and_grad_buffer_init(original):
                 param_data_allocated = True
                 return allocate_from_pool(
                     "parameter",
+                    "param",
                     "MEGATRON_RCCL_SDMA_EAGER_PARAM_BYTES",
                     zeros_args,
                     zeros_kwargs,
@@ -313,6 +314,7 @@ def make_param_and_grad_buffer_init(original):
                 grad_data_allocated = True
                 return allocate_from_pool(
                     "gradient",
+                    "grad",
                     "MEGATRON_RCCL_SDMA_EAGER_GRAD_BYTES",
                     zeros_args,
                     zeros_kwargs,
@@ -437,6 +439,7 @@ def patch_rccl_sdma_param_all_gather(ctx: PatchContext) -> None:
             pool,
             device,
             eager_param_bytes,
+            role="param",
         )
 
     try:
@@ -550,6 +553,7 @@ def patch_rccl_sdma_grad_reduce_scatter(ctx: PatchContext) -> None:
             pool,
             device,
             eager_grad_bytes,
+            role="grad",
         )
 
     try:

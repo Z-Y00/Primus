@@ -392,6 +392,41 @@ def test_eager_direct_param_buffer_is_transferred_once(monkeypatch):
     )
 
 
+def test_same_size_param_and_grad_eager_reservations_do_not_collide(monkeypatch):
+    """Regression test: bf16 param_data and bf16 grad_data are frequently the
+    same byte size, so eager reservations for the two roles must not share a
+    cache key -- otherwise the grad reservation silently no-ops (or gets
+    consumed by the param take), leaving grad_data with no eager buffer."""
+    device = torch.device("cuda", 0)
+    group = SimpleNamespace(group_name="ce", rank=lambda: 0)
+    pool = SimpleNamespace()
+    original_empty = torch.empty
+
+    def fake_empty(*args, **kwargs):
+        if kwargs.get("device") == device:
+            kwargs = dict(kwargs)
+            kwargs.pop("device")
+        return original_empty(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "empty", fake_empty)
+    monkeypatch.setattr(torch.cuda, "use_mem_pool", lambda _pool: nullcontext())
+    rccl_sdma_param_gather.reset_runtime_state_for_tests()
+
+    rccl_sdma_param_gather.reserve_direct_param_buffer(group, pool, device, 16, role="param")
+    rccl_sdma_param_gather.reserve_direct_param_buffer(group, pool, device, 16, role="grad")
+
+    param_tensor = rccl_sdma_param_gather.take_direct_param_buffer(
+        group, device, 8, torch.bfloat16, role="param"
+    )
+    grad_tensor = rccl_sdma_param_gather.take_direct_param_buffer(
+        group, device, 8, torch.bfloat16, role="grad"
+    )
+
+    assert param_tensor is not None
+    assert grad_tensor is not None
+    assert param_tensor.data_ptr() != grad_tensor.data_ptr()
+
+
 def test_param_buffer_wrapper_rendezvouses_and_marks_buckets(monkeypatch):
     import megatron.core.distributed.param_and_grad_buffer as pgb
 
@@ -430,7 +465,7 @@ def test_param_buffer_wrapper_rendezvouses_and_marks_buckets(monkeypatch):
     )
     monkeypatch.setattr(torch.cuda, "use_mem_pool", lambda _pool: PoolContext())
     monkeypatch.setattr(torch, "zeros", fake_zeros)
-    monkeypatch.setattr(rccl_sdma_param_gather, "take_direct_param_buffer", lambda *_args: None)
+    monkeypatch.setattr(rccl_sdma_param_gather, "take_direct_param_buffer", lambda *_args, **_kwargs: None)
 
     def original(
         self,
@@ -528,7 +563,7 @@ def test_grad_buffer_wrapper_also_rendezvouses_when_grad_backend_enabled(monkeyp
     monkeypatch.setattr(rccl_sdma_param_gather, "rendezvous_direct_param_buffer", fake_rendezvous)
     monkeypatch.setattr(torch.cuda, "use_mem_pool", lambda _pool: PoolContext())
     monkeypatch.setattr(torch, "zeros", fake_zeros)
-    monkeypatch.setattr(rccl_sdma_param_gather, "take_direct_param_buffer", lambda *_args: None)
+    monkeypatch.setattr(rccl_sdma_param_gather, "take_direct_param_buffer", lambda *_args, **_kwargs: None)
 
     def original(
         self,
@@ -597,7 +632,7 @@ def test_param_buffer_allocation_failure_reports_eager_retry(monkeypatch):
     monkeypatch.setattr(
         rccl_sdma_param_gather,
         "take_direct_param_buffer",
-        lambda *_args: None,
+        lambda *_args, **_kwargs: None,
     )
     monkeypatch.setattr(torch.cuda, "use_mem_pool", lambda _pool: nullcontext())
 

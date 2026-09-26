@@ -26,7 +26,13 @@ import torch.distributed._symmetric_memory as symm_mem
 LARGE_SEGMENT_BYTES = 2 * 1024 * 1024
 
 _DIRECT_POOLS: dict[tuple[str, int], torch.cuda.MemPool] = {}
-_DIRECT_EAGER_PARAM_BUFFERS: dict[tuple[str, int, int], torch.Tensor] = {}
+# Keyed by (role, group_name, device_index, size_bytes). ``role`` ("param" or
+# "grad") keeps same-sized param and gradient eager reservations from
+# colliding -- e.g. bf16 param_data and bf16 grad_data are frequently the same
+# size, and without a role dimension the second reservation would either
+# no-op against the first key or be silently consumed by the first buffer's
+# `torch.zeros` interception, leaving the other role with nothing to take.
+_DIRECT_EAGER_BUFFERS: dict[tuple[str, str, int, int], torch.Tensor] = {}
 _SDMA_GROUP: dist.ProcessGroup | None = None
 DIRECT_BUFFER_ATTR = "_primus_rccl_sdma_direct_buffer"
 
@@ -102,24 +108,30 @@ def reserve_direct_param_buffer(
     pool: torch.cuda.MemPool,
     device: torch.device,
     size_bytes: int,
+    role: str = "param",
 ) -> None:
-    """Allocate a direct parameter buffer before model allocations fragment HBM."""
+    """Allocate a direct buffer before model allocations fragment HBM.
+
+    ``role`` distinguishes param-data from grad-data reservations so two
+    same-sized eager reservations (a common case: bf16 param_data and bf16
+    grad_data are often identically sized) don't collide on the same cache key.
+    """
     if size_bytes <= 0:
-        raise ValueError("eager direct parameter buffer size must be positive")
+        raise ValueError("eager direct buffer size must be positive")
     device_index = device.index
     if device_index is None:
         device_index = torch.cuda.current_device()
     group_name = group.group_name if group is not None else ""
-    key = (group_name, device_index, size_bytes)
-    if key in _DIRECT_EAGER_PARAM_BUFFERS:
+    key = (role, group_name, device_index, size_bytes)
+    if key in _DIRECT_EAGER_BUFFERS:
         return
     with torch.cuda.use_mem_pool(pool):
         storage = torch.empty(size_bytes, dtype=torch.uint8, device=device)
-    _DIRECT_EAGER_PARAM_BUFFERS[key] = storage
+    _DIRECT_EAGER_BUFFERS[key] = storage
     rank = group.rank() if group is not None else int(os.getenv("RANK", "0"))
     if rank == 0:
         print(
-            "[RCCL-SDMA:Megatron] eagerly reserved direct parameter buffer "
+            f"[RCCL-SDMA:Megatron] eagerly reserved direct {role} buffer "
             f"bytes={size_bytes} group={group_name or '<pending>'}",
             flush=True,
         )
@@ -130,8 +142,9 @@ def take_direct_param_buffer(
     device: torch.device,
     shape,
     dtype: torch.dtype,
+    role: str = "param",
 ) -> torch.Tensor | None:
-    """Transfer a size-compatible eager reservation to Megatron's param_data."""
+    """Transfer a size-compatible eager reservation to Megatron's param/grad data."""
     numel = int(shape) if isinstance(shape, int) else math.prod(shape)
     size_bytes = numel * torch.empty((), dtype=dtype).element_size()
     device_index = device.index
@@ -139,32 +152,38 @@ def take_direct_param_buffer(
         device_index = torch.cuda.current_device()
     matching_keys = [
         key
-        for key in _DIRECT_EAGER_PARAM_BUFFERS
-        if key[0] in ("", group.group_name)
-        and key[1] == device_index
-        and key[2] >= size_bytes
-        and key[2] - size_bytes < LARGE_SEGMENT_BYTES
+        for key in _DIRECT_EAGER_BUFFERS
+        if key[0] == role
+        and key[1] in ("", group.group_name)
+        and key[2] == device_index
+        and key[3] >= size_bytes
+        and key[3] - size_bytes < LARGE_SEGMENT_BYTES
     ]
     if not matching_keys:
         if group.rank() == 0:
             recommended_bytes = recommended_eager_param_bytes(size_bytes)
+            env_var = (
+                "MEGATRON_RCCL_SDMA_EAGER_PARAM_BYTES"
+                if role == "param"
+                else "MEGATRON_RCCL_SDMA_EAGER_GRAD_BYTES"
+            )
             print(
-                "[RCCL-SDMA:Megatron] no eager direct parameter buffer match "
+                f"[RCCL-SDMA:Megatron] no eager direct {role} buffer match "
                 f"requested_bytes={size_bytes} "
                 f"recommended_eager_bytes={recommended_bytes} "
-                f"reserved={list(_DIRECT_EAGER_PARAM_BUFFERS)}; "
+                f"reserved={list(_DIRECT_EAGER_BUFFERS)}; "
                 "if direct allocation fails, rerun with "
-                f"MEGATRON_RCCL_SDMA_EAGER_PARAM_BYTES={recommended_bytes}",
+                f"{env_var}={recommended_bytes}",
                 flush=True,
             )
         return None
-    key = min(matching_keys, key=lambda candidate: candidate[2])
-    storage = _DIRECT_EAGER_PARAM_BUFFERS.pop(key)
+    key = min(matching_keys, key=lambda candidate: candidate[3])
+    storage = _DIRECT_EAGER_BUFFERS.pop(key)
     tensor = storage[:size_bytes].view(dtype).view(shape)
     tensor.zero_()
     if group.rank() == 0:
         print(
-            "[RCCL-SDMA:Megatron] consumed eager direct parameter buffer "
+            f"[RCCL-SDMA:Megatron] consumed eager direct {role} buffer "
             f"reserved_bytes={storage.nbytes} requested_bytes={size_bytes}",
             flush=True,
         )
@@ -201,5 +220,5 @@ def reset_runtime_state_for_tests() -> None:
     """Clear process-global caches used by isolated unit tests."""
     global _SDMA_GROUP
     _DIRECT_POOLS.clear()
-    _DIRECT_EAGER_PARAM_BUFFERS.clear()
+    _DIRECT_EAGER_BUFFERS.clear()
     _SDMA_GROUP = None
