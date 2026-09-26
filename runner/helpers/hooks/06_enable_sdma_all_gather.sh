@@ -5,21 +5,27 @@
 # See LICENSE for license information.
 ###############################################################################
 #
-# Global hook: opt into an SDMA/RCCL AllGather path.
+# Global hook: opt into RCCL copy-engine collective paths.
 #
 # Backend selectors:
 #
 #   export FSDP_ALL_GATHER_BACKEND=rccl_sdma
-#   export MEGATRON_PARAM_GATHER_BACKEND=rccl_sdma  # direct symmetric buffers
+#   export MEGATRON_PARAM_GATHER_BACKEND=rccl_sdma  # direct symmetric buffers, param AllGather
+#   export MEGATRON_GRAD_REDUCE_BACKEND=rccl_sdma   # direct symmetric buffers, grad ReduceScatter
 #   primus-cli direct -- train pretrain --config <any existing yaml>
+#
+# MEGATRON_GRAD_REDUCE_BACKEND requires MEGATRON_PARAM_GATHER_BACKEND to also
+# be set: gradient ReduceScatter reuses the same dedicated process group and
+# symmetric buffer pool as parameter AllGather, it cannot be enabled alone.
 #
 # The FSDP selector uses global NCCL_CTA_POLICY=2 because FSDP's custom
 # collective owns the relevant communicator. The Megatron distributed-
-# optimizer selector creates a dedicated zero-CTA process group in Python, so
-# this hook deliberately does not change the global policy; ReduceScatter and
-# gradient-norm AllReduce remain on their stock RCCL path.
+# optimizer selectors create dedicated zero-CTA process groups in Python
+# (both reuse the same group when both are enabled), so this hook
+# deliberately does not change the global policy; gradient-norm AllReduce and
+# other collectives remain on their stock RCCL path.
 #
-# For either selector, this hook:
+# For any selector, this hook:
 #   1. Exports cuMem and allocator prerequisites used by RCCL's copy-engine path.
 #   2. Propagates the selector into torchrun children.
 #   3. Rebuilds the bundled LD_PRELOAD interposer
@@ -37,16 +43,29 @@
 set -euo pipefail
 
 fsdp_backend="${FSDP_ALL_GATHER_BACKEND:-}"
-megatron_backend="${MEGATRON_PARAM_GATHER_BACKEND:-}"
+megatron_param_backend="${MEGATRON_PARAM_GATHER_BACKEND:-}"
+megatron_grad_backend="${MEGATRON_GRAD_REDUCE_BACKEND:-}"
 
-if [[ "${fsdp_backend}" != "rccl_sdma" && "${megatron_backend}" != "rccl_sdma" ]]; then
+if [[ "${fsdp_backend}" != "rccl_sdma" \
+      && "${megatron_param_backend}" != "rccl_sdma" \
+      && "${megatron_grad_backend}" != "rccl_sdma" ]]; then
     exit 0
 fi
 
-if [[ "${fsdp_backend}" == "rccl_sdma" && "${megatron_backend}" == "rccl_sdma" ]]; then
+if [[ "${fsdp_backend}" == "rccl_sdma" \
+      && ( "${megatron_param_backend}" == "rccl_sdma" \
+           || "${megatron_grad_backend}" == "rccl_sdma" ) ]]; then
     echo "[ERROR] FSDP and Megatron RCCL-SDMA cannot be enabled together: " \
          "the FSDP path requires global NCCL_CTA_POLICY=2, while the Megatron " \
-         "path requires zero CTA only on its dedicated parameter-AllGather group." >&2
+         "paths require zero CTA only on their dedicated process group(s)." >&2
+    exit 2
+fi
+
+# Gradient ReduceScatter reuses the parameter AllGather patch's dedicated
+# process group and symmetric buffer pool, so it cannot be enabled alone.
+if [[ "${megatron_grad_backend}" == "rccl_sdma" && "${megatron_param_backend}" != "rccl_sdma" ]]; then
+    echo "[ERROR] MEGATRON_GRAD_REDUCE_BACKEND=rccl_sdma requires " \
+         "MEGATRON_PARAM_GATHER_BACKEND=rccl_sdma to also be enabled." >&2
     exit 2
 fi
 
@@ -82,16 +101,24 @@ if [[ "${fsdp_backend}" == "rccl_sdma" ]]; then
         echo "env.PRIMUS_TURBO_GROUPED_GEMM_BACKEND=${PRIMUS_TURBO_GROUPED_GEMM_BACKEND}"
     fi
 fi
-if [[ "${megatron_backend}" == "rccl_sdma" ]]; then
-    echo "env.MEGATRON_PARAM_GATHER_BACKEND=rccl_sdma"
+if [[ "${megatron_param_backend}" == "rccl_sdma" || "${megatron_grad_backend}" == "rccl_sdma" ]]; then
     echo "env.ENABLE_SDMA_ALLGATHER=0"
     echo "env.MEGATRON_RCCL_SDMA_CTA_POLICY=${MEGATRON_RCCL_SDMA_CTA_POLICY:-2}"
-    echo "env.MEGATRON_RCCL_SDMA_EAGER_INIT=${MEGATRON_RCCL_SDMA_EAGER_INIT:-1}"
     for name in MEGATRON_RCCL_SDMA_EAGER_PARAM_BYTES MEGATRON_RCCL_SDMA_LOG; do
         if [[ -n "${!name:-}" ]]; then
             echo "env.${name}=${!name}"
         fi
     done
+fi
+if [[ "${megatron_param_backend}" == "rccl_sdma" ]]; then
+    echo "env.MEGATRON_PARAM_GATHER_BACKEND=rccl_sdma"
+    echo "env.MEGATRON_RCCL_SDMA_EAGER_INIT=${MEGATRON_RCCL_SDMA_EAGER_INIT:-1}"
+fi
+if [[ "${megatron_grad_backend}" == "rccl_sdma" ]]; then
+    echo "env.MEGATRON_GRAD_REDUCE_BACKEND=rccl_sdma"
+    if [[ -n "${MEGATRON_RCCL_SDMA_EAGER_GRAD_BYTES:-}" ]]; then
+        echo "env.MEGATRON_RCCL_SDMA_EAGER_GRAD_BYTES=${MEGATRON_RCCL_SDMA_EAGER_GRAD_BYTES}"
+    fi
 fi
 # The native Primus RCCL build used by Megatron has the cuMem probe fix and
 # does not need the legacy attribute-drain interposer.

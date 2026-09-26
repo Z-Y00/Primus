@@ -166,6 +166,140 @@ def test_direct_force_sync_uses_async_pg_stream_then_synchronizes(monkeypatch):
     assert bucket_group.param_gather_dispatched
 
 
+def test_grad_reduce_scatter_enabled_env_gate(monkeypatch):
+    monkeypatch.delenv("MEGATRON_GRAD_REDUCE_BACKEND", raising=False)
+    assert not rccl_sdma_param_all_gather_patches.rccl_sdma_grad_reduce_scatter_enabled()
+
+    monkeypatch.setenv("MEGATRON_GRAD_REDUCE_BACKEND", "rccl_sdma")
+    assert rccl_sdma_param_all_gather_patches.rccl_sdma_grad_reduce_scatter_enabled()
+
+
+def _make_grad_bucket_group(original_group, grad_data, **ddp_overrides):
+    ddp_config = SimpleNamespace(
+        use_distributed_optimizer=True,
+        num_distributed_optimizer_instances=1,
+        overlap_grad_reduce=True,
+        average_in_collective=False,
+        check_for_nan_in_grad=False,
+        check_for_large_grads=False,
+    )
+    for key, value in ddp_overrides.items():
+        setattr(ddp_config, key, value)
+    return SimpleNamespace(
+        ddp_config=ddp_config,
+        grad_reduce_handle=None,
+        cached_grad_buffer_shard_list=[None],
+        buckets=[SimpleNamespace(grad_data=grad_data, gradient_scaling_factor=1.0)],
+        intra_distributed_optimizer_instance_size=2,
+        intra_distributed_optimizer_instance_rank=0,
+        intra_distributed_optimizer_instance_group=original_group,
+    )
+
+
+def test_direct_reduce_scatter_uses_native_coalesced_work_handle(monkeypatch):
+    monkeypatch.setenv("MEGATRON_GRAD_REDUCE_BACKEND", "rccl_sdma")
+
+    original_group = SimpleNamespace()
+    dedicated_group = SimpleNamespace()
+    native_handle = SimpleNamespace()
+    coalescing_calls = []
+    reduce_scatter_calls = []
+
+    def fake_coalescing_manager(group, async_ops):
+        coalescing_calls.append((group, async_ops))
+        return nullcontext(native_handle)
+
+    def fake_reduce_scatter(output, input_, op, group, async_op):
+        reduce_scatter_calls.append((output, input_, op, group, async_op))
+
+    monkeypatch.setattr(
+        torch.distributed.distributed_c10d,
+        "_coalescing_manager",
+        fake_coalescing_manager,
+    )
+    monkeypatch.setattr(torch.distributed, "reduce_scatter_tensor", fake_reduce_scatter)
+    monkeypatch.setattr(
+        rccl_sdma_param_gather,
+        "get_sdma_process_group",
+        lambda _group: dedicated_group,
+    )
+
+    grad_data = torch.zeros(8)
+    rccl_sdma_param_gather.mark_direct_param_buffer(grad_data)
+    bucket_group = _make_grad_bucket_group(original_group, grad_data)
+
+    wrapped = rccl_sdma_param_all_gather_patches.make_start_grad_sync(
+        lambda *_args, **_kwargs: pytest.fail("native Megatron fallback must not run")
+    )
+    wrapped(bucket_group)
+
+    assert coalescing_calls == [(dedicated_group, True)]
+    assert len(reduce_scatter_calls) == 1
+    assert reduce_scatter_calls[0][1] is grad_data
+    assert reduce_scatter_calls[0][2] == torch.distributed.ReduceOp.SUM
+    assert reduce_scatter_calls[0][3:] == (dedicated_group, True)
+    assert bucket_group.grad_reduce_handle is native_handle
+
+
+@pytest.mark.parametrize(
+    "ddp_overrides",
+    [
+        {"use_distributed_optimizer": False},
+        {"num_distributed_optimizer_instances": 2},
+    ],
+)
+def test_reduce_scatter_falls_back_to_native_for_unsupported_configs(monkeypatch, ddp_overrides):
+    monkeypatch.setenv("MEGATRON_GRAD_REDUCE_BACKEND", "rccl_sdma")
+
+    grad_data = torch.zeros(8)
+    bucket_group = _make_grad_bucket_group(SimpleNamespace(), grad_data, **ddp_overrides)
+
+    fallback_calls = []
+
+    def fallback(self, force_all_reduce=False):
+        fallback_calls.append(force_all_reduce)
+
+    wrapped = rccl_sdma_param_all_gather_patches.make_start_grad_sync(fallback)
+    wrapped(bucket_group)
+
+    assert fallback_calls == [False]
+
+
+def test_reduce_scatter_requires_direct_grad_buffer(monkeypatch):
+    monkeypatch.setenv("MEGATRON_GRAD_REDUCE_BACKEND", "rccl_sdma")
+
+    dedicated_group = SimpleNamespace()
+    monkeypatch.setattr(
+        rccl_sdma_param_gather,
+        "get_sdma_process_group",
+        lambda _group: dedicated_group,
+    )
+
+    grad_data = torch.zeros(8)  # not marked as a direct buffer
+    bucket_group = _make_grad_bucket_group(SimpleNamespace(), grad_data)
+
+    wrapped = rccl_sdma_param_all_gather_patches.make_start_grad_sync(
+        lambda *_args, **_kwargs: pytest.fail("native Megatron fallback must not run")
+    )
+
+    with pytest.raises(RuntimeError, match="direct symmetric gradient buffer"):
+        wrapped(bucket_group)
+
+
+def test_bucket_group_init_rejects_multiple_distributed_optimizer_instances():
+    def original_init(self, ddp_config, **_kwargs):
+        self.ddp_config = ddp_config
+
+    wrapped_init = rccl_sdma_param_all_gather_patches.make_bucket_group_init(original_init)
+    ddp_config = SimpleNamespace(
+        use_distributed_optimizer=True,
+        num_distributed_optimizer_instances=2,
+    )
+
+    with pytest.raises(RuntimeError, match="does not support multiple"):
+        wrapped_init(SimpleNamespace(), ddp_config=ddp_config)
+
+
 def test_direct_buffer_marker_applies_to_views():
     tensor = SimpleNamespace()
 
@@ -349,6 +483,102 @@ def test_param_buffer_wrapper_rendezvouses_and_marks_buckets(monkeypatch):
     assert allocation_scopes == [True, False]
     assert rccl_sdma_param_gather.is_direct_param_buffer(param_data)
     assert rccl_sdma_param_gather.is_direct_param_buffer(bucket_data)
+
+
+def test_grad_buffer_wrapper_also_rendezvouses_when_grad_backend_enabled(monkeypatch):
+    import megatron.core.distributed.param_and_grad_buffer as pgb
+
+    monkeypatch.setenv("MEGATRON_GRAD_REDUCE_BACKEND", "rccl_sdma")
+
+    group = SimpleNamespace(group_name="ce", rank=lambda: 1)
+    pool = SimpleNamespace()
+    handles = []
+    param_data = SimpleNamespace()
+    grad_data = SimpleNamespace()
+    param_bucket_data = SimpleNamespace()
+    grad_bucket_data = SimpleNamespace()
+    pool_active = False
+    allocation_scopes = []
+
+    class PoolContext:
+        def __enter__(self):
+            nonlocal pool_active
+            pool_active = True
+
+        def __exit__(self, *_args):
+            nonlocal pool_active
+            pool_active = False
+
+    def fake_zeros(*_args, **_kwargs):
+        allocation_scopes.append(pool_active)
+        return param_data if len(allocation_scopes) == 1 else grad_data
+
+    def fake_rendezvous(tensor, _group):
+        rccl_sdma_param_gather.mark_direct_param_buffer(tensor)
+        handle = SimpleNamespace()
+        handles.append(handle)
+        return handle
+
+    monkeypatch.setattr(pgb, "is_mxfp8tensor", lambda _param: False)
+    monkeypatch.setattr(
+        rccl_sdma_param_gather,
+        "prepare_direct_param_buffer_pool",
+        lambda _group, _device: (group, pool),
+    )
+    monkeypatch.setattr(rccl_sdma_param_gather, "rendezvous_direct_param_buffer", fake_rendezvous)
+    monkeypatch.setattr(torch.cuda, "use_mem_pool", lambda _pool: PoolContext())
+    monkeypatch.setattr(torch, "zeros", fake_zeros)
+    monkeypatch.setattr(rccl_sdma_param_gather, "take_direct_param_buffer", lambda *_args: None)
+
+    def original(
+        self,
+        ddp_config,
+        param_dtype,
+        grad_dtype,
+        params,
+        data_parallel_group,
+        bucket_size,
+        param_to_name,
+        gradient_scaling_factor,
+        param_indices,
+        nccl_ub,
+        pg_collection=None,
+    ):
+        del (
+            ddp_config,
+            params,
+            data_parallel_group,
+            bucket_size,
+            param_to_name,
+            gradient_scaling_factor,
+            param_indices,
+            nccl_ub,
+            pg_collection,
+        )
+        self.param_data = torch.zeros(1, dtype=param_dtype, device="cuda")
+        self.grad_data = torch.zeros(1, dtype=grad_dtype, device="cuda")
+        self.buckets = [SimpleNamespace(param_data=param_bucket_data, grad_data=grad_bucket_data)]
+
+    wrapped = rccl_sdma_param_all_gather_patches.make_param_and_grad_buffer_init(original)
+    buffer = SimpleNamespace()
+    wrapped(
+        buffer,
+        SimpleNamespace(use_distributed_optimizer=True),
+        torch.bfloat16,
+        torch.float32,
+        [SimpleNamespace(device=torch.device("cuda", 0))],
+        SimpleNamespace(),
+        1024,
+        {},
+        1.0,
+        [0],
+        False,
+    )
+
+    assert allocation_scopes == [True, True]
+    assert buffer._primus_rccl_sdma_grad_symmetric_memory is handles[1]
+    assert rccl_sdma_param_gather.is_direct_param_buffer(grad_data)
+    assert rccl_sdma_param_gather.is_direct_param_buffer(grad_bucket_data)
 
 
 def test_param_buffer_allocation_failure_reports_eager_retry(monkeypatch):
@@ -539,6 +769,7 @@ def _run_sdma_hook(extra_env, kernel_release="6.8.0"):
     for name in (
         "FSDP_ALL_GATHER_BACKEND",
         "MEGATRON_PARAM_GATHER_BACKEND",
+        "MEGATRON_GRAD_REDUCE_BACKEND",
         "MEGATRON_RCCL_SDMA_DIRECT",
         "MEGATRON_RCCL_SDMA_SCRATCH_BYTES",
         "MEGATRON_RCCL_SDMA_EAGER_INIT",
@@ -613,3 +844,33 @@ def test_hook_rejects_combined_fsdp_and_megatron_backends():
 
     assert result.returncode == 2
     assert "cannot be enabled together" in result.stderr
+
+
+def test_hook_rejects_grad_backend_without_param_backend():
+    result = _run_sdma_hook({"MEGATRON_GRAD_REDUCE_BACKEND": "rccl_sdma"})
+
+    assert result.returncode == 2
+    assert "requires MEGATRON_PARAM_GATHER_BACKEND=rccl_sdma" in result.stderr
+
+
+def test_hook_propagates_grad_backend_and_eager_grad_bytes():
+    result = _run_sdma_hook(
+        {
+            "MEGATRON_PARAM_GATHER_BACKEND": "rccl_sdma",
+            "MEGATRON_GRAD_REDUCE_BACKEND": "rccl_sdma",
+            "MEGATRON_RCCL_SDMA_EAGER_GRAD_BYTES": "1048576",
+        },
+    )
+
+    assert result.returncode == 0
+    assert "env.MEGATRON_PARAM_GATHER_BACKEND=rccl_sdma" in result.stdout
+    assert "env.MEGATRON_GRAD_REDUCE_BACKEND=rccl_sdma" in result.stdout
+    assert "env.MEGATRON_RCCL_SDMA_EAGER_GRAD_BYTES=1048576" in result.stdout
+
+
+def test_grad_reduce_scatter_patch_requires_param_backend(monkeypatch):
+    monkeypatch.delenv("MEGATRON_PARAM_GATHER_BACKEND", raising=False)
+    monkeypatch.setenv("MEGATRON_GRAD_REDUCE_BACKEND", "rccl_sdma")
+
+    with pytest.raises(RuntimeError, match="requires MEGATRON_PARAM_GATHER_BACKEND=rccl_sdma"):
+        rccl_sdma_param_all_gather_patches.patch_rccl_sdma_grad_reduce_scatter(None)

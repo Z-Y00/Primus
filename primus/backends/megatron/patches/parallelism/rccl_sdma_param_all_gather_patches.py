@@ -6,9 +6,16 @@
 
 """Route Megatron parameter AllGather directly through RCCL CE.
 
-The replacement touches only ``_ParamAndGradBucketGroup.start_param_sync``.
-Gradient ReduceScatter, gradient-norm AllReduce, and other collectives retain
-their original process groups and algorithms.
+The parameter AllGather replacement touches only
+``_ParamAndGradBucketGroup.start_param_sync``. Gradient-norm AllReduce and
+other collectives retain their original process groups and algorithms.
+
+Gradient ReduceScatter can optionally be routed the same way (see
+``patch_rccl_sdma_grad_reduce_scatter`` below), reusing PyTorch's own default
+``reduce_scatter_tensor`` collective -- just directed at the dedicated
+zero-CTA group instead of a custom collective/kernel. It requires the
+parameter AllGather patch to also be enabled, since it reuses the same
+dedicated process group and symmetric buffer pool.
 """
 
 from __future__ import annotations
@@ -25,12 +32,17 @@ from primus.core.patches import PatchContext, register_patch
 from primus.core.utils.module_utils import log_rank_0, warning_rank_0
 
 BACKEND_ENV = "MEGATRON_PARAM_GATHER_BACKEND"
+GRAD_BACKEND_ENV = "MEGATRON_GRAD_REDUCE_BACKEND"
 RCCL_SDMA_BACKEND = "rccl_sdma"
 _EAGER_RUNTIME_INITIALIZED = False
 
 
 def rccl_sdma_param_gather_enabled(_ctx: PatchContext | None = None) -> bool:
     return os.getenv(BACKEND_ENV, "").strip().lower() == RCCL_SDMA_BACKEND
+
+
+def rccl_sdma_grad_reduce_scatter_enabled(_ctx: PatchContext | None = None) -> bool:
+    return os.getenv(GRAD_BACKEND_ENV, "").strip().lower() == RCCL_SDMA_BACKEND
 
 
 def validate_global_cta_policy() -> None:
@@ -110,6 +122,112 @@ def make_start_param_sync(original):
     return start_param_sync
 
 
+def make_start_grad_sync(original):
+    """Build the RCCL CE replacement for Megatron's gradient reduce-scatter.
+
+    Mirrors ``make_start_param_sync``: only the destination process group and
+    buffer changes. The collective itself stays ``torch.distributed.reduce_scatter_tensor``,
+    the same op Megatron's own ``start_grad_sync`` calls by default.
+    """
+    from megatron.core.distributed.param_and_grad_buffer import shard_buffer
+    from torch.distributed.distributed_c10d import _coalescing_manager
+
+    from primus.backends.megatron.core.distributed.rccl_sdma_param_gather import (
+        get_sdma_process_group,
+        is_direct_param_buffer,
+    )
+
+    def start_grad_sync(self, force_all_reduce: bool = False):
+        if (
+            not self.ddp_config.use_distributed_optimizer
+            or force_all_reduce
+            or self.ddp_config.num_distributed_optimizer_instances != 1
+        ):
+            return original(self, force_all_reduce=force_all_reduce)
+
+        assert (
+            self.grad_reduce_handle is None
+        ), "Should not have multiple communication calls outstanding at once"
+
+        if self.ddp_config.check_for_nan_in_grad or self.ddp_config.check_for_large_grads:
+            self.check_grads(
+                check_for_nan_or_inf=self.ddp_config.check_for_nan_in_grad,
+                check_for_large=self.ddp_config.check_for_large_grads,
+            )
+
+        for bucket in self.buckets:
+            if bucket.gradient_scaling_factor != 1.0:
+                bucket.grad_data *= bucket.gradient_scaling_factor
+
+        reduce_op = torch.distributed.ReduceOp.SUM
+        if self.ddp_config.average_in_collective:
+            reduce_op = torch.distributed.ReduceOp.AVG
+
+        async_op = self.ddp_config.overlap_grad_reduce
+        jobs = []
+        for index, bucket in enumerate(self.buckets):
+            if self.cached_grad_buffer_shard_list[index] is None:
+                self.cached_grad_buffer_shard_list[index] = shard_buffer(
+                    bucket.grad_data,
+                    self.intra_distributed_optimizer_instance_size,
+                )
+            local_data = self.cached_grad_buffer_shard_list[index][
+                self.intra_distributed_optimizer_instance_rank
+            ]
+            jobs.append((local_data, bucket.grad_data))
+
+        if jobs:
+            group = get_sdma_process_group(self.intra_distributed_optimizer_instance_group)
+            if not all(is_direct_param_buffer(grad_data) for _local_data, grad_data in jobs):
+                raise RuntimeError(
+                    "RCCL-SDMA requires every Megatron gradient bucket to use "
+                    "the direct symmetric gradient buffer"
+                )
+            # Match Megatron's native gradient-reduce stream semantics. RCCL's
+            # synchronous null-stream fallback crashes on imported ROCr VMM
+            # pointers, so even synchronous callers launch through the
+            # ProcessGroupNCCL async stream and synchronize before returning.
+            with _coalescing_manager(group, async_ops=True) as cm:
+                for local_data, grad_data in jobs:
+                    torch.distributed.reduce_scatter_tensor(
+                        local_data,
+                        grad_data,
+                        op=reduce_op,
+                        group=group,
+                        async_op=True,
+                    )
+            if async_op:
+                self.grad_reduce_handle = cm
+            else:
+                cm.wait()
+                torch.cuda.current_stream(jobs[0][1].device).synchronize()
+                self.grad_reduce_handle = None
+        else:
+            self.grad_reduce_handle = None
+
+    return start_grad_sync
+
+
+def make_bucket_group_init(original):
+    """Validate the RCCL-SDMA gradient reduce-scatter constraints eagerly."""
+    signature = inspect.signature(original)
+
+    @functools.wraps(original)
+    def wrapped(self, *args, **kwargs):
+        result = original(self, *args, **kwargs)
+        bound = signature.bind(self, *args, **kwargs)
+        bound.apply_defaults()
+        ddp_config = bound.arguments["ddp_config"]
+        if ddp_config.use_distributed_optimizer and ddp_config.num_distributed_optimizer_instances != 1:
+            raise RuntimeError(
+                "RCCL-SDMA gradient ReduceScatter does not support multiple "
+                "distributed-optimizer instances"
+            )
+        return result
+
+    return wrapped
+
+
 def make_param_and_grad_buffer_init(original):
     """Allocate eligible Megatron parameter buffers from the symmetric pool."""
     signature = inspect.signature(original)
@@ -142,45 +260,66 @@ def make_param_and_grad_buffer_init(original):
             take_direct_param_buffer,
         )
 
+        grad_reduce_scatter_enabled = rccl_sdma_grad_reduce_scatter_enabled()
+
         device = params[0].device
         group, pool = prepare_direct_param_buffer_pool(original_group, device)
         original_zeros = torch.zeros
         allocation_thread = threading.get_ident()
         param_data_allocated = False
+        grad_data_allocated = False
+
+        def allocate_from_pool(kind: str, env_var: str, zeros_args, zeros_kwargs):
+            """Allocate a direct buffer, reusing an eager reservation if one matches."""
+            dtype = zeros_kwargs.get("dtype")
+            if dtype is None:
+                raise RuntimeError(f"RCCL-SDMA direct {kind} allocation requires an explicit dtype")
+            eager_tensor = take_direct_param_buffer(group, device, zeros_args[0], dtype)
+            if eager_tensor is not None:
+                return eager_tensor
+            numel = int(zeros_args[0])
+            size_bytes = numel * torch.empty((), dtype=dtype).element_size()
+            recommended_bytes = recommended_eager_param_bytes(size_bytes)
+            try:
+                with torch.cuda.use_mem_pool(pool):
+                    return original_zeros(*zeros_args, **zeros_kwargs)
+            except RuntimeError as exc:
+                raise RuntimeError(
+                    f"RCCL-SDMA could not allocate the direct symmetric {kind} "
+                    f"buffer ({size_bytes} bytes). Rerun with "
+                    f"{env_var}={recommended_bytes} to reserve it before model construction."
+                ) from exc
 
         def allocate_param_data(*zeros_args, **zeros_kwargs):
-            nonlocal param_data_allocated
-            if threading.get_ident() == allocation_thread and not param_data_allocated:
+            nonlocal param_data_allocated, grad_data_allocated
+            if threading.get_ident() != allocation_thread:
+                return original_zeros(*zeros_args, **zeros_kwargs)
+
+            # Megatron allocates param_data first and grad_data second in this
+            # eligible non-MXFP8 constructor path.
+            if not param_data_allocated:
                 param_data_allocated = True
-                dtype = zeros_kwargs.get("dtype")
-                if dtype is None:
-                    raise RuntimeError("RCCL-SDMA direct param_data allocation requires an explicit dtype")
-                eager_tensor = take_direct_param_buffer(
-                    group,
-                    device,
-                    zeros_args[0],
-                    dtype,
+                return allocate_from_pool(
+                    "parameter",
+                    "MEGATRON_RCCL_SDMA_EAGER_PARAM_BYTES",
+                    zeros_args,
+                    zeros_kwargs,
                 )
-                if eager_tensor is not None:
-                    return eager_tensor
-                numel = int(zeros_args[0])
-                size_bytes = numel * torch.empty((), dtype=dtype).element_size()
-                recommended_bytes = recommended_eager_param_bytes(size_bytes)
-                try:
-                    with torch.cuda.use_mem_pool(pool):
-                        return original_zeros(*zeros_args, **zeros_kwargs)
-                except RuntimeError as exc:
-                    raise RuntimeError(
-                        "RCCL-SDMA could not allocate the direct symmetric parameter "
-                        f"buffer ({size_bytes} bytes). Rerun with "
-                        "MEGATRON_RCCL_SDMA_EAGER_PARAM_BYTES="
-                        f"{recommended_bytes} to reserve it before model construction."
-                    ) from exc
+
+            # Second call is grad_data. Only route it through the direct pool
+            # when gradient ReduceScatter is also being routed through SDMA;
+            # otherwise leave it on the normal allocator (unchanged behavior).
+            if not grad_data_allocated and grad_reduce_scatter_enabled:
+                grad_data_allocated = True
+                return allocate_from_pool(
+                    "gradient",
+                    "MEGATRON_RCCL_SDMA_EAGER_GRAD_BYTES",
+                    zeros_args,
+                    zeros_kwargs,
+                )
+
             return original_zeros(*zeros_args, **zeros_kwargs)
 
-        # Megatron allocates param_data first and grad_data second in this
-        # eligible non-MXFP8 constructor path. Only param_data participates in
-        # direct AllGather, so keep grad_data on the normal allocator.
         with mock.patch.object(torch, "zeros", allocate_param_data):
             result = original(self, *args, **kwargs)
 
@@ -194,9 +333,35 @@ def make_param_and_grad_buffer_init(original):
         for bucket in self.buckets:
             if bucket.param_data is not None:
                 mark_direct_param_buffer(bucket.param_data)
+
+        if grad_reduce_scatter_enabled:
+            if not grad_data_allocated or self.grad_data is None:
+                raise RuntimeError("RCCL-SDMA direct reduce-scatter did not allocate grad_data")
+            grad_symmetric_memory = rendezvous_direct_param_buffer(self.grad_data, group)
+            self._primus_rccl_sdma_grad_symmetric_memory = grad_symmetric_memory
+            mark_direct_param_buffer(self.grad_data)
+            for bucket in self.buckets:
+                if bucket.grad_data is not None:
+                    mark_direct_param_buffer(bucket.grad_data)
         return result
 
     return wrapped
+
+
+def _install_direct_buffer_allocation_patch(pgb) -> None:
+    """Install the shared ``_ParamAndGradBuffer.__init__`` direct-allocation patch.
+
+    Shared by both the parameter-AllGather and gradient-ReduceScatter patches
+    so that either one, alone or together, gets buffers allocated from the
+    symmetric pool.
+    """
+    param_and_grad_buffer = getattr(pgb, "_ParamAndGradBuffer", None)
+    if param_and_grad_buffer is None:
+        raise RuntimeError("RCCL-SDMA direct gather requires _ParamAndGradBuffer")
+    direct_marker = "_primus_rccl_sdma_direct_allocation_patched"
+    if not getattr(param_and_grad_buffer, direct_marker, False):
+        param_and_grad_buffer.__init__ = make_param_and_grad_buffer_init(param_and_grad_buffer.__init__)
+        setattr(param_and_grad_buffer, direct_marker, True)
 
 
 def eager_initialize_runtime() -> bool:
@@ -296,13 +461,7 @@ def patch_rccl_sdma_param_all_gather(ctx: PatchContext) -> None:
         bucket_group.start_param_sync = make_start_param_sync(bucket_group.start_param_sync)
         setattr(bucket_group, marker, True)
 
-    param_and_grad_buffer = getattr(pgb, "_ParamAndGradBuffer", None)
-    if param_and_grad_buffer is None:
-        raise RuntimeError("RCCL-SDMA direct gather requires _ParamAndGradBuffer")
-    direct_marker = "_primus_rccl_sdma_direct_allocation_patched"
-    if not getattr(param_and_grad_buffer, direct_marker, False):
-        param_and_grad_buffer.__init__ = make_param_and_grad_buffer_init(param_and_grad_buffer.__init__)
-        setattr(param_and_grad_buffer, direct_marker, True)
+    _install_direct_buffer_allocation_patch(pgb)
 
     if os.getenv("MEGATRON_RCCL_SDMA_EAGER_INIT", "0") == "1":
         if not eager_initialize_runtime():
@@ -342,3 +501,84 @@ def patch_rccl_sdma_param_all_gather(ctx: PatchContext) -> None:
                 setattr(training_module, eager_marker, True)
 
     log_rank_0("[Patch:megatron.distributed.rccl_sdma_param_all_gather] installed")
+
+
+@register_patch(
+    "megatron.distributed.rccl_sdma_grad_reduce_scatter",
+    backend="megatron",
+    phase="before_train",
+    description=(
+        "Route distributed-optimizer gradient ReduceScatter through a dedicated "
+        "zero-CTA RCCL process group using PyTorch's default reduce_scatter_tensor."
+    ),
+    condition=rccl_sdma_grad_reduce_scatter_enabled,
+)
+def patch_rccl_sdma_grad_reduce_scatter(ctx: PatchContext) -> None:
+    del ctx
+
+    # Gradient ReduceScatter reuses the same dedicated zero-CTA group and
+    # symmetric buffer pool as parameter AllGather, so it cannot stand alone.
+    if not rccl_sdma_param_gather_enabled():
+        raise RuntimeError(
+            f"{GRAD_BACKEND_ENV}=rccl_sdma requires {BACKEND_ENV}=rccl_sdma to "
+            "also be enabled: gradient ReduceScatter reuses the same dedicated "
+            "zero-CTA process group and symmetric buffer pool as parameter AllGather."
+        )
+
+    # The dedicated process group selects zero CTA through pg_options. A global
+    # policy may already have affected WORLD/DP communicators by this phase, so
+    # fail instead of silently removing it too late.
+    validate_global_cta_policy()
+    os.environ["NCCL_CUMEM_ENABLE"] = "1"
+    os.environ["NCCL_LOCAL_REGISTER"] = "0"
+    os.environ["TORCH_NCCL_USE_TENSOR_REGISTER_ALLOCATOR_HOOK"] = "true"
+
+    eager_grad_bytes = int(os.getenv("MEGATRON_RCCL_SDMA_EAGER_GRAD_BYTES", "0"))
+    if eager_grad_bytes:
+        import torch.distributed._symmetric_memory as symm_mem
+
+        from primus.backends.megatron.core.distributed.rccl_sdma_param_gather import (
+            reserve_direct_param_buffer,
+        )
+
+        device = torch.device("cuda", int(os.getenv("LOCAL_RANK", torch.cuda.current_device())))
+        torch.cuda.set_device(device)
+        symm_mem.set_backend("NCCL")
+        pool = symm_mem.get_mem_pool(device)
+        reserve_direct_param_buffer(
+            None,
+            pool,
+            device,
+            eager_grad_bytes,
+        )
+
+    try:
+        import megatron.core.distributed.param_and_grad_buffer as pgb
+    except ImportError as exc:
+        warning_rank_0(
+            "[Patch:megatron.distributed.rccl_sdma_grad_reduce_scatter] "
+            f"Megatron distributed modules are unavailable; skipping: {exc}"
+        )
+        return
+
+    bucket_group = getattr(pgb, "_ParamAndGradBucketGroup", None)
+    if bucket_group is None:
+        warning_rank_0(
+            "[Patch:megatron.distributed.rccl_sdma_grad_reduce_scatter] "
+            "_ParamAndGradBucketGroup is unavailable; skipping"
+        )
+        return
+
+    init_marker = "_primus_rccl_sdma_grad_reduce_scatter_init_patched"
+    if not getattr(bucket_group, init_marker, False):
+        bucket_group.__init__ = make_bucket_group_init(bucket_group.__init__)
+        setattr(bucket_group, init_marker, True)
+
+    marker = "_primus_rccl_sdma_grad_reduce_scatter_patched"
+    if not getattr(bucket_group, marker, False):
+        bucket_group.start_grad_sync = make_start_grad_sync(bucket_group.start_grad_sync)
+        setattr(bucket_group, marker, True)
+
+    _install_direct_buffer_allocation_patch(pgb)
+
+    log_rank_0("[Patch:megatron.distributed.rccl_sdma_grad_reduce_scatter] installed")
