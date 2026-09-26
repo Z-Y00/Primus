@@ -37,6 +37,13 @@ _SDMA_GROUP: dist.ProcessGroup | None = None
 DIRECT_BUFFER_ATTR = "_primus_rccl_sdma_direct_buffer"
 
 
+def _eager_bytes_env_var(role: str) -> str:
+    """Return the env var that sizes the eager reservation for ``role``."""
+    return (
+        "MEGATRON_RCCL_SDMA_EAGER_PARAM_BYTES" if role == "param" else "MEGATRON_RCCL_SDMA_EAGER_GRAD_BYTES"
+    )
+
+
 def recommended_eager_param_bytes(size_bytes: int) -> int:
     """Round a parameter buffer size up to the symmetric allocator granule."""
     if size_bytes <= 0:
@@ -150,6 +157,12 @@ def take_direct_param_buffer(
     device_index = device.index
     if device_index is None:
         device_index = torch.cuda.current_device()
+    # Any reservation at least as large as the request is usable -- the buffer
+    # is sliced to size_bytes below. Requiring a near-exact size match would
+    # force callers to predict the buffer size to within the allocator granule;
+    # an over-sized reservation would silently go unmatched and fall back to a
+    # second pool allocation on top of the reservation it should have reused,
+    # which exhausts the pool instead of consuming it.
     matching_keys = [
         key
         for key in _DIRECT_EAGER_BUFFERS
@@ -157,16 +170,11 @@ def take_direct_param_buffer(
         and key[1] in ("", group.group_name)
         and key[2] == device_index
         and key[3] >= size_bytes
-        and key[3] - size_bytes < LARGE_SEGMENT_BYTES
     ]
     if not matching_keys:
         if group.rank() == 0:
             recommended_bytes = recommended_eager_param_bytes(size_bytes)
-            env_var = (
-                "MEGATRON_RCCL_SDMA_EAGER_PARAM_BYTES"
-                if role == "param"
-                else "MEGATRON_RCCL_SDMA_EAGER_GRAD_BYTES"
-            )
+            env_var = _eager_bytes_env_var(role)
             print(
                 f"[RCCL-SDMA:Megatron] no eager direct {role} buffer match "
                 f"requested_bytes={size_bytes} "
@@ -182,11 +190,18 @@ def take_direct_param_buffer(
     tensor = storage[:size_bytes].view(dtype).view(shape)
     tensor.zero_()
     if group.rank() == 0:
-        print(
+        slack_bytes = storage.nbytes - size_bytes
+        message = (
             f"[RCCL-SDMA:Megatron] consumed eager direct {role} buffer "
-            f"reserved_bytes={storage.nbytes} requested_bytes={size_bytes}",
-            flush=True,
+            f"reserved_bytes={storage.nbytes} requested_bytes={size_bytes}"
         )
+        if slack_bytes >= LARGE_SEGMENT_BYTES:
+            env_var = _eager_bytes_env_var(role)
+            message += (
+                f"; {slack_bytes} bytes of the reservation are unused, "
+                f"set {env_var}={recommended_eager_param_bytes(size_bytes)} to reclaim them"
+            )
+        print(message, flush=True)
     return tensor
 
 

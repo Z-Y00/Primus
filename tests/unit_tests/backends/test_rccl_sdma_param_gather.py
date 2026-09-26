@@ -392,6 +392,40 @@ def test_eager_direct_param_buffer_is_transferred_once(monkeypatch):
     )
 
 
+def test_oversized_eager_reservation_is_still_matched(monkeypatch, capsys):
+    """Regression test: an eager reservation larger than the buffer must still
+    be reused. Requiring a near-exact match meant an over-sized reservation
+    went unmatched, and the caller then allocated a *second* buffer from the
+    pool on top of the reservation it should have consumed -- exhausting the
+    pool instead of using it."""
+    device = torch.device("cuda", 0)
+    group = SimpleNamespace(group_name="ce", rank=lambda: 0)
+    pool = SimpleNamespace()
+    original_empty = torch.empty
+
+    def fake_empty(*args, **kwargs):
+        if kwargs.get("device") == device:
+            kwargs = dict(kwargs)
+            kwargs.pop("device")
+        return original_empty(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "empty", fake_empty)
+    monkeypatch.setattr(torch.cuda, "use_mem_pool", lambda _pool: nullcontext())
+    rccl_sdma_param_gather.reset_runtime_state_for_tests()
+
+    # Reserve far more than the 2 MiB granule beyond what is requested.
+    oversize = 16 + 8 * 1024 * 1024
+    rccl_sdma_param_gather.reserve_direct_param_buffer(group, pool, device, oversize, role="param")
+
+    tensor = rccl_sdma_param_gather.take_direct_param_buffer(group, device, 8, torch.bfloat16, role="param")
+
+    assert tensor is not None
+    assert tensor.shape == (8,)
+    assert tensor.dtype == torch.bfloat16
+    # The unused remainder is reported so the reservation can be right-sized.
+    assert "bytes of the reservation are unused" in capsys.readouterr().out
+
+
 def test_same_size_param_and_grad_eager_reservations_do_not_collide(monkeypatch):
     """Regression test: bf16 param_data and bf16 grad_data are frequently the
     same byte size, so eager reservations for the two roles must not share a
