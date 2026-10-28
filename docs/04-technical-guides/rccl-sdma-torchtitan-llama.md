@@ -31,9 +31,30 @@ RCCL then picks:
 | Host kernel | Linux 6.8 or newer (RCCL cuMem); the hook refuses older kernels |
 | Image | `unifiedtrainingdockers.azurecr.io/utd/nightly:primus_rocm10.2_20261021` (RCCL 2.32.3, hierarchical CE). Older RCCL builds silently stay on kernels for multi-node runs |
 | PyTorch | 2.12 or newer (`SymmMemAllGather`) |
-| Primus | A version that includes the `fully_shard` rebinding fix in `sdma_symm_mem_collectives.py`. Without it, the patch logs `installed` but RCCL reports `CE-registered disqualified ... ceRegWindow=0` and AllGather stays on kernels |
+| Primus | A version that includes the `fully_shard` rebinding fix in `sdma_symm_mem_collectives.py` (see [Getting the code](#getting-the-code)). Without it, the patch logs `installed` but RCCL reports `CE-registered disqualified ... ceRegWindow=0` and AllGather stays on kernels |
 | Network (multi-node) | RoCE with routing between rails |
 | Tokenizer | Llama 3.1 tokenizer files in a local directory, passed as `--model.hf_assets_path` (mock data still loads the tokenizer) |
+
+## Getting the code
+
+Until the fix is merged upstream, use the `torchtitan-sdma-fsdp-fix` branch of
+[Z-Y00/Primus](https://github.com/Z-Y00/Primus/tree/torchtitan-sdma-fsdp-fix):
+
+```bash
+git clone -b torchtitan-sdma-fsdp-fix https://github.com/Z-Y00/Primus.git
+cd Primus && git submodule update --init third_party/torchtitan
+```
+
+Mount this checkout over the image's copy (`-v /path/to/Primus:/workspace/Primus` in the
+launch command below). Primus runs TorchTitan from `third_party/torchtitan`, so that submodule
+is required.
+
+Alternatively, keep the image's Primus and copy the changed files over it inside the container
+before launching:
+
+- `primus/backends/torchtitan/patches/sdma_symm_mem_collectives.py`
+- `runner/helpers/hooks/06_enable_sdma_all_gather.sh`
+- `runner/.primus.yaml`, needed only when launching with `primus-cli slurm` or `primus-cli container`
 
 Run each comparison only on nodes that are completely idle. Check `rocm-smi --showpids`,
 `--showuse` and `--showmemuse` before starting: Slurm can report a node as idle while a stray
