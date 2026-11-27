@@ -84,6 +84,10 @@ muse_spark_compile_fuse_next_norm: false
 # routed experts as Primus-Turbo Mega MoE (fused dispatch / combine with the grouped GEMMs, post-norm
 # stage2; gfx1250, bf16, Turbo grouped GEMM experts, expert parallelism within one node)
 muse_spark_mega_moe: false
+# gated QKV split + weightless Q / K norms + RoPE as one Primus-Turbo Triton kernel per pass (TP=1, CP=1)
+muse_spark_fused_qk_norm_rope: false
+# the logit soft-cap as Triton kernels (bitwise eager); inside the cross entropy with deferred_cross_entropy
+muse_spark_triton_softcap: false
 
 mtp_num_layers: null
 expert_model_parallel_size: 1

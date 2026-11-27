@@ -100,6 +100,16 @@ class MuseSparkTransformerConfig(TransformerConfig):
     grouped MLP. The router, the latent projections and ``pre_expert_norm`` stay as they are. Needs
     Primus-Turbo grouped GEMM experts, expert parallelism within one node and bf16 parameters. Parsed strictly
     (``bool_flag``)."""
+    muse_spark_fused_qk_norm_rope: bool = False
+    """Split the gated packed QKV, apply the weightless Q / K norms and the rotate-half RoPE (none on NoPE
+    layers) as Primus-Turbo's ``fused_gated_qkv_rmsnorm_rope``, one Triton kernel per pass, with the unfused
+    path's bf16 roundings (``transformer/muse_spark/attention.py``). TP=1, CP=1, self attention without packed
+    sequences or inference; other calls take Megatron's path. Takes precedence over ``muse_spark_compile_norms``
+    for the Q / K norms. Parsed strictly (``bool_flag``)."""
+    muse_spark_triton_softcap: bool = False
+    """Run the logit soft-cap as Triton kernels, bitwise the eager ops (``models/muse_spark/softcap_kernels.py``).
+    With the deferred TE cross entropy (``deferred_cross_entropy``) the soft-cap runs inside the cross entropy:
+    the soft-capped logits are never written. Parsed strictly (``bool_flag``)."""
     residual_gate_init_value: float = -0.9
     """Initial value of every residual gate ``g`` for a run from random weights (a checkpoint
     load overwrites it). HF initialises ``g ~ N(0, 0.02)`` (beta = 0.5, alpha = 0.87): the
@@ -146,6 +156,8 @@ class MuseSparkTransformerConfig(TransformerConfig):
             "muse_spark_compile_norms",
             "muse_spark_compile_fuse_next_norm",
             "muse_spark_mega_moe",
+            "muse_spark_fused_qk_norm_rope",
+            "muse_spark_triton_softcap",
             "embedding_norm",
             "window_size_is_hf_sliding_window",
         ):
