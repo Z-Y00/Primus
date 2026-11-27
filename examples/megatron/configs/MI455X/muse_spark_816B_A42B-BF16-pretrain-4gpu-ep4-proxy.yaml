@@ -14,6 +14,10 @@ workspace: ${PRIMUS_WORKSPACE:./output}
 #     collective instead of a separate 1 / DP scaling pass over every grad buffer. The expert
 #     grad buffers still take one scaling pass (expert DP 1, factor 1 / 4).
 #     Measured: 274 -> 272 ms (MBS 1), 430 -> 426 ms (MBS 2).
+#   - env PRIMUS_FUSED_ADAM_EXPERT_GRAD_SCALE: the expert grads stay unscaled until Primus's
+#     HIP Adam, which multiplies the 1 / 4 in with the clip coefficient (the grad norm
+#     weights the expert part by it), so no scaling pass is left.
+#     Measured: 272 -> 261 ms (MBS 1), 426 -> 417 ms (MBS 2).
 #   - muse_spark_compile_norms needs the compiled regions to accept a changing shape: under EP
 #     the expert SwiGLU sees a different row count every step.
 #
@@ -53,6 +57,7 @@ env:
   PRIMUS_FUSED_ADAM_CLIP: "1"
   PRIMUS_FUSED_ADAM_BF16_WRITEBACK: "1"
   PRIMUS_STATIC_BF16_LOSS_SCALE_CPU: "1"
+  PRIMUS_FUSED_ADAM_EXPERT_GRAD_SCALE: "1"
 
 modules:
   pre_trainer:
