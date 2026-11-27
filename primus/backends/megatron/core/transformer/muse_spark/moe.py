@@ -481,6 +481,90 @@ class MuseSparkMoELayer(MoELayer):
             object.__setattr__(self.experts, "_muse_post_expert_norm", self.post_expert_norm)
         else:
             raise TypeError("Muse Spark MoE needs Muse Spark experts (see muse_spark_expert_cls)")
+        self.mega_moe = config_flag(config, "muse_spark_mega_moe", False)
+        if self.mega_moe:
+            self._check_mega_moe(config)
+
+    def _check_mega_moe(self, config):
+        fc1 = getattr(self.experts, "linear_fc1", None)
+        fc2 = getattr(self.experts, "linear_fc2", None)
+        if not (
+            isinstance(getattr(fc1, "weights", None), torch.Tensor)
+            and isinstance(getattr(fc2, "weights", None), torch.Tensor)
+        ):
+            raise ValueError(
+                "muse_spark_mega_moe runs on the experts' stacked weights: it needs Primus-Turbo grouped GEMM "
+                "experts (use_turbo_grouped_gemm)"
+            )
+        if config.params_dtype != torch.bfloat16:
+            raise ValueError(f"muse_spark_mega_moe needs bf16 parameters, got {config.params_dtype}")
+        ep_size = self.ep_group.size()
+        if not 1 < ep_size <= 8:
+            raise ValueError(
+                f"muse_spark_mega_moe needs expert parallelism within one node (EP 2 to 8), got EP {ep_size}"
+            )
+        if not (config.gated_linear_unit and self.experts.activation_func is F.silu):
+            raise ValueError("muse_spark_mega_moe computes the experts' SiLU-SwiGLU only")
+        if config.activation_func_clamp_value is not None or config.glu_linear_offset:
+            raise ValueError("muse_spark_mega_moe computes the plain SiLU-SwiGLU (no clamp, no glu offset)")
+        log_rank_0(
+            f"Muse Spark MoE: Primus-Turbo Mega MoE (EP {ep_size}, post-norm stage2) in place of "
+            f"{type(self.token_dispatcher).__name__} + {type(self.experts).__name__}"
+        )
+
+    def forward(self, hidden_states, intermediate_tensors=None, padding_mask=None):
+        if not self.mega_moe:
+            return super().forward(hidden_states, intermediate_tensors, padding_mask)
+        if intermediate_tensors is not None or padding_mask is not None:
+            raise NotImplementedError(
+                "muse_spark_mega_moe takes neither intermediate tensors nor a padding mask"
+            )
+        from primus_turbo.flydsl.utils.glu_activation import GLUActivation
+        from primus_turbo.pytorch.ops.moe.fused_mega_moe import (
+            fused_mega_moe_stage1,
+            fused_mega_moe_stage2_post_norm,
+        )
+
+        from primus.backends.megatron.core.extensions.primus_turbo import (
+            _fuse_wgrad_accum_pattern,
+        )
+
+        shape = hidden_states.shape
+        probs, routing_map = self.route(hidden_states)
+        x, _ = self.fc1_latent_proj(hidden_states)
+        x = self.pre_expert_norm(x)
+        x = x.reshape(-1, x.shape[-1])
+        probs = probs.reshape(-1, probs.shape[-1])
+        # the routed experts of each token (exactly topk per row) and their probs
+        topk_idx = (
+            routing_map.reshape(probs.shape).to(probs.dtype).topk(self.config.moe_router_topk, dim=-1).indices
+        )
+        topk_weights = probs.gather(1, topk_idx).float()
+        fc1, fc2, norm = self.experts.linear_fc1, self.experts.linear_fc2, self.post_expert_norm
+        # the expert wgrads go into main_grad (fp32 too) as the Turbo grouped GEMM experts' do
+        pattern = _fuse_wgrad_accum_pattern(self.config, fc1.weights, grouped=True)
+        accum = {"fuse_wgrad_accum_pattern": pattern, "wgrad_accum_fp32": True} if pattern else {}
+        # DDP's parameter all-gather (overlap_param_gather) waits in these modules' forward pre-hooks
+        x = _run_forward_pre_hooks(fc1, x)
+        l1_out, dispatch_weights, handle = fused_mega_moe_stage1(
+            x, topk_idx, topk_weights, fc1.weights, self.ep_group, **accum
+        )
+        _run_forward_pre_hooks(fc2, l1_out)
+        _run_forward_pre_hooks(norm, l1_out)
+        y = fused_mega_moe_stage2_post_norm(
+            l1_out,
+            dispatch_weights,
+            handle,
+            topk_idx,
+            fc2.weights,
+            norm.weight,
+            norm.eps,
+            self.ep_group,
+            GLUActivation.swiglu(),
+            **accum,
+        )
+        output, _ = self.fc2_latent_proj(y.view(*shape[:-1], y.shape[-1]))
+        return output, None
 
     @maybe_skip_or_early_return_by_cudagraph("preprocess")
     def preprocess(self, hidden_states: torch.Tensor, probs: torch.Tensor, routing_map: torch.Tensor):

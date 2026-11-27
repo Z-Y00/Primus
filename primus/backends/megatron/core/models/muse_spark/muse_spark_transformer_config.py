@@ -93,6 +93,13 @@ class MuseSparkTransformerConfig(TransformerConfig):
     residual before it (attention residual -> ``pre_mlp_layernorm``; MoE residual -> the next
     layer's ``input_layernorm``), handing the output to the norm. Off by default: no faster
     than the separate graphs on the 4-layer proxy (MI455X). Parsed strictly (``bool_flag``)."""
+    muse_spark_mega_moe: bool = False
+    """Run the routed experts as Primus-Turbo's Mega MoE (gfx1250, bf16): stage1 (dispatch + fc1 grouped GEMM)
+    and the post-norm stage2 (SwiGLU + fc2 grouped GEMM + ``post_expert_norm`` with the routing prob + combine),
+    on the experts' own ``linear_fc1`` / ``linear_fc2`` weights, in place of the token dispatcher and the
+    grouped MLP. The router, the latent projections and ``pre_expert_norm`` stay as they are. Needs
+    Primus-Turbo grouped GEMM experts, expert parallelism within one node and bf16 parameters. Parsed strictly
+    (``bool_flag``)."""
     residual_gate_init_value: float = -0.9
     """Initial value of every residual gate ``g`` for a run from random weights (a checkpoint
     load overwrites it). HF initialises ``g ~ N(0, 0.02)`` (beta = 0.5, alpha = 0.87): the
@@ -138,6 +145,7 @@ class MuseSparkTransformerConfig(TransformerConfig):
             "muse_spark_fused_centered_norm",
             "muse_spark_compile_norms",
             "muse_spark_compile_fuse_next_norm",
+            "muse_spark_mega_moe",
             "embedding_norm",
             "window_size_is_hf_sliding_window",
         ):

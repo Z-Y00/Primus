@@ -81,6 +81,9 @@ muse_spark_fused_centered_norm: true
 muse_spark_compile_norms: false
 # with compile_norms: also fold each centered norm into the gated residual before it
 muse_spark_compile_fuse_next_norm: false
+# routed experts as Primus-Turbo Mega MoE (fused dispatch / combine with the grouped GEMMs, post-norm
+# stage2; gfx1250, bf16, Turbo grouped GEMM experts, expert parallelism within one node)
+muse_spark_mega_moe: false
 
 mtp_num_layers: null
 expert_model_parallel_size: 1
