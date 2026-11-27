@@ -18,6 +18,12 @@ workspace: ${PRIMUS_WORKSPACE:./output}
 #     HIP Adam, which multiplies the 1 / 4 in with the clip coefficient (the grad norm
 #     weights the expert part by it), so no scaling pass is left.
 #     Measured: 272 -> 261 ms (MBS 1), 426 -> 417 ms (MBS 2).
+#   - use_turbo_deepep with turbo_deepep_num_cu 64: Primus-Turbo DeepEP (its gfx1250 FlyDSL
+#     backend, as in kimi_k3.1_pro_4L-BF16-pretrain.yaml) instead of the alltoall dispatcher:
+#     261 -> 255 ms (MBS 1), 417 -> 399 ms (MBS 2); 32 CUs: 256 ms (MBS 1).
+#   - deferred_cross_entropy and ddp_num_buckets 24: 255 -> 251 ms (MBS 1), 399 -> 389 ms (MBS 2).
+#     overlap_moe_expert_parallel_comm stays off: with two micro-batches per GPU only the middle
+#     phase overlaps; it measured the same at MBS 1 and 5 ms slower at MBS 2.
 #   - muse_spark_compile_norms needs the compiled regions to accept a changing shape: under EP
 #     the expert SwiGLU sees a different row count every step.
 #
@@ -103,6 +109,8 @@ modules:
       overlap_param_gather: true
       # average the dense grads in the reduce collective (no separate 1 / DP scaling pass)
       ddp_average_in_collective: true
+      # smaller grad / param buckets: the reduce-scatter starts earlier in the backward
+      ddp_num_buckets: 24
       # off: the dense / head wgrads keep the separate add (see the header)
       gradient_accumulation_fusion: false
 
@@ -145,8 +153,8 @@ modules:
       # Muse Spark on MI455X
       muse_spark_compile_norms: true
 
-      # Primus-Turbo: grouped GEMM experts and FlyDSL sliding-window attention; the all-to-all
-      # stays on the alltoall dispatcher (Turbo DeepEP off). turbo_sync_free_moe_stage stays 0 (the fused router
+      # Primus-Turbo: grouped GEMM experts, FlyDSL sliding-window attention and DeepEP for the
+      # all-to-all (see the header). turbo_sync_free_moe_stage stays 0 (the fused router
       # drops Muse Spark's selection bias; megatron.args.muse_spark_no_fused_router).
       enable_primus_turbo: true
       use_turbo_attention: true
@@ -155,10 +163,14 @@ modules:
       turbo_grouped_gemm_backend: bf16:flydsl
       # expert wgrads straight into the fp32 main_grad (dense ones keep the add; see the header)
       turbo_grouped_gemm_wgrad_accum_fusion: true
-      use_turbo_deepep: false
+      # sets moe_token_dispatcher_type to flex with the Primus-Turbo DeepEP dispatcher
+      use_turbo_deepep: true
+      turbo_deepep_num_cu: 64
       moe_token_dispatcher_type: alltoall
       moe_permute_fusion: true
 
       # Fused CE (TE) on the soft-capped logits
       cross_entropy_loss_fusion: true
       cross_entropy_fusion_impl: te
+      # gradient built in backward, without TE's per-micro-batch host sync (torch.equal on grad_output)
+      deferred_cross_entropy: true
