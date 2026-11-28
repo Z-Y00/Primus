@@ -43,6 +43,19 @@ from primus.core.utils.module_utils import log_rank_0
 __all__ = ["MuseSparkQKNorm", "MuseSparkSelfAttention"]
 
 
+def _turbo_shape_error(qkv, freqs, split):
+    """Why Primus-Turbo's ``fused_qkv_rmsnorm_rope`` cannot take this input (gate block, no weights), or None.
+    A Turbo without that op, or whose op still requires the norm weights, gives a reason, not an error."""
+    try:
+        from primus_turbo.pytorch.kernels.rope.qk_rmsnorm_rope_impl import (
+            qk_rmsnorm_rope_shape_error,
+        )
+
+        return qk_rmsnorm_rope_shape_error(qkv, None, None, freqs, split)
+    except (ImportError, AttributeError, TypeError) as exc:
+        return f"Primus-Turbo has no fused_qkv_rmsnorm_rope with a gate block ({exc})"
+
+
 class MuseSparkQKNorm(MuseSparkRMSNorm):
     """Weightless per-head RMSNorm for the q / k heads: ``MuseSparkRMSNorm(with_scale=False)``.
 
@@ -123,11 +136,6 @@ class MuseSparkSelfAttention(SelfAttention):
             return super().get_query_key_value_tensors(
                 hidden_states, key_value_states, output_gate=output_gate, split_qkv=split_qkv
             )
-        from primus_turbo.pytorch.kernels.rope.qk_rmsnorm_rope_impl import (
-            qk_rmsnorm_rope_shape_error,
-        )
-        from primus_turbo.pytorch.ops.rope import fused_qkv_rmsnorm_rope
-
         freqs, rope = ctx
         mixed_qkv, _ = apply_module(self.linear_qkv)(hidden_states)
         hn = self.hidden_size_per_attention_head
@@ -138,8 +146,10 @@ class MuseSparkSelfAttention(SelfAttention):
         if rope and freqs.shape[0] != mixed_qkv.shape[0]:
             freqs = freqs[: mixed_qkv.shape[0]]
         rope_freqs = freqs if rope else None
-        if qk_rmsnorm_rope_shape_error(mixed_qkv, None, None, rope_freqs, split) is not None:
+        if _turbo_shape_error(mixed_qkv, rope_freqs, split) is not None:
             return self._split_norm_rope(mixed_qkv, freqs, rope, heads, hn)
+        from primus_turbo.pytorch.ops.rope import fused_qkv_rmsnorm_rope
+
         query, key, value, gate = fused_qkv_rmsnorm_rope(
             mixed_qkv, None, None, rope_freqs, split, self.q_layernorm.eps
         )
