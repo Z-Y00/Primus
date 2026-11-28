@@ -16,9 +16,12 @@ the layer spec (:class:`MuseSparkQKNorm`); the query scale
 
 With ``muse_spark_fused_qk_norm_rope`` the split of the gated packed QKV, the
 weightless Q / K norms and the rotate-half RoPE (none on NoPE layers) run as
-Primus-Turbo's ``fused_gated_qkv_rmsnorm_rope``, one Triton kernel per pass, with
-the unfused path's bf16 roundings. The forward stashes the RoPE angles and runs
-Megatron's forward without them; ``get_query_key_value_tensors`` applies them.
+Primus-Turbo's ``fused_qkv_rmsnorm_rope`` (gate block, no norm weights; its Triton
+backend), one kernel per pass. The norm output and the inverse-RoPE gradient are
+rounded to bf16 as the unfused modules do; the RoPE is rounded once per output from
+fp32 cos / sin (as TE's fused RoPE), not after each multiply and add as Megatron's
+unfused RoPE. The forward stashes the RoPE angles and runs Megatron's forward
+without them; ``get_query_key_value_tensors`` applies them.
 """
 
 import torch
@@ -38,24 +41,6 @@ from primus.backends.megatron.core.transformer.muse_spark.norms import (
 from primus.core.utils.module_utils import log_rank_0
 
 __all__ = ["MuseSparkQKNorm", "MuseSparkSelfAttention"]
-
-
-def _cos_sin(freqs, seq_len, dtype):
-    """Megatron's unfused RoPE tables ``cos(freqs).to(dtype)``, ``sin(freqs).to(dtype)`` for the first ``seq_len``
-    positions as ``[S, D]``, built once per ``freqs`` tensor (every layer gets the same one, and Megatron's rotary
-    embedding caches it across steps)."""
-    key = (seq_len, dtype)
-    cached = getattr(freqs, "_muse_cos_sin", None)
-    if cached is None or cached[0] != key:
-        f = freqs[:seq_len]
-        D = f.shape[-1]
-        cached = (
-            key,
-            torch.cos(f).to(dtype).reshape(-1, D).contiguous(),
-            torch.sin(f).to(dtype).reshape(-1, D).contiguous(),
-        )
-        freqs._muse_cos_sin = cached
-    return cached[1], cached[2]
 
 
 class MuseSparkQKNorm(MuseSparkRMSNorm):
@@ -138,21 +123,25 @@ class MuseSparkSelfAttention(SelfAttention):
             return super().get_query_key_value_tensors(
                 hidden_states, key_value_states, output_gate=output_gate, split_qkv=split_qkv
             )
-        from primus_turbo.pytorch.kernels.rope.gated_qkv_rmsnorm_rope_impl import (
-            gated_qkv_rmsnorm_rope_shape_error,
+        from primus_turbo.pytorch.kernels.rope.qk_rmsnorm_rope_impl import (
+            qk_rmsnorm_rope_shape_error,
         )
-        from primus_turbo.pytorch.ops.rope import fused_gated_qkv_rmsnorm_rope
+        from primus_turbo.pytorch.ops.rope import fused_qkv_rmsnorm_rope
 
         freqs, rope = ctx
         mixed_qkv, _ = apply_module(self.linear_qkv)(hidden_states)
         hn = self.hidden_size_per_attention_head
         heads = self.num_attention_heads_per_partition // self.num_query_groups_per_partition
         mixed_qkv = mixed_qkv.view(*mixed_qkv.shape[:2], self.num_query_groups_per_partition, -1)
-        cos, sin = _cos_sin(freqs, mixed_qkv.shape[0], mixed_qkv.dtype) if rope else (None, None)
-        if gated_qkv_rmsnorm_rope_shape_error(mixed_qkv, cos, sin, heads, rope) is not None:
+        split = [heads * hn, heads * hn, hn, hn]
+        # the same freqs object every layer, so Turbo builds its cos / sin tables once
+        if rope and freqs.shape[0] != mixed_qkv.shape[0]:
+            freqs = freqs[: mixed_qkv.shape[0]]
+        rope_freqs = freqs if rope else None
+        if qk_rmsnorm_rope_shape_error(mixed_qkv, None, None, rope_freqs, split) is not None:
             return self._split_norm_rope(mixed_qkv, freqs, rope, heads, hn)
-        query, gate, key, value = fused_gated_qkv_rmsnorm_rope(
-            mixed_qkv, cos, sin, heads, self.q_layernorm.eps, rope
+        query, key, value, gate = fused_qkv_rmsnorm_rope(
+            mixed_qkv, None, None, rope_freqs, split, self.q_layernorm.eps
         )
         if not self.__dict__.get("_qk_norm_rope_logged"):
             self._qk_norm_rope_logged = True

@@ -102,8 +102,9 @@ class MuseSparkTransformerConfig(TransformerConfig):
     (``bool_flag``)."""
     muse_spark_fused_qk_norm_rope: bool = False
     """Split the gated packed QKV, apply the weightless Q / K norms and the rotate-half RoPE (none on NoPE
-    layers) as Primus-Turbo's ``fused_gated_qkv_rmsnorm_rope``, one Triton kernel per pass, with the unfused
-    path's bf16 roundings (``transformer/muse_spark/attention.py``). TP=1, CP=1, self attention without packed
+    layers) as Primus-Turbo's ``fused_qkv_rmsnorm_rope`` with a gate block and no norm weights, one kernel per
+    pass; the RoPE is rounded once per output, as TE's fused RoPE (``transformer/muse_spark/attention.py``).
+    Needs a Primus-Turbo whose ``fused_qkv_rmsnorm_rope`` takes a gate block. TP=1, CP=1, self attention without packed
     sequences or inference; other calls take Megatron's path. Takes precedence over ``muse_spark_compile_norms``
     for the Q / K norms. Parsed strictly (``bool_flag``)."""
     muse_spark_triton_softcap: bool = False
