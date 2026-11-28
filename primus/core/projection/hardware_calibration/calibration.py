@@ -21,24 +21,18 @@ from primus.core.projection.hardware_calibration.compute_clock import (
     DEFAULT_MIN_SETTLE_S,
     back_calculate_compute_clock,
     gemm_dtype_candidates,
-    make_backend_predictor,
     make_origami_predictor,
     time_gemm_ms,
 )
 from primus.core.projection.hardware_calibration.device_info import (
     SETTLE_TIMEOUT_S,
     ClockSampler,
-    _peak_hbm_gbps,
     describe_device,
     make_clock_reader,
 )
 from primus.core.projection.hardware_calibration.gemm_shapes import (
     collect_workload_gemms,
     select_calibration_gemms,
-)
-from primus.core.projection.hardware_calibration.matrix_core_loop import (
-    matrix_loop_unavailable_reason,
-    run_matrix_core_loop,
 )
 from primus.core.projection.hardware_calibration.stream_bandwidth import (
     DEFAULT_ARRAY_MIB,
@@ -87,15 +81,8 @@ def run_hardware_calibration(
     device_index: Optional[int] = None,
     max_gemms: int = 4,
     stream_array_mib: int = DEFAULT_ARRAY_MIB,
-    gemm_backend: Optional[str] = None,
-    gpu_arch: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Measure this rank's GPU; returns a JSON-serialisable payload.
-
-    *gemm_backend* (the projection's ``--gemm-backend``) models the GEMMs the
-    clock is solved from; Origami when unset or when that backend cannot model
-    the device.  *gpu_arch* (``--gpu-arch``) names the backend's hardware
-    profile only on a device Primus does not recognise.
 
     Frees what it allocated and resets peak-memory stats; after a GPU fault
     the cleanup is best effort and the original error is the one raised.
@@ -108,9 +95,7 @@ def run_hardware_calibration(
     torch.cuda.set_device(device_index)
     device = torch.device("cuda", device_index)
     try:
-        return _measure(
-            training_config, device, device_index, max_gemms, stream_array_mib, gemm_backend, gpu_arch
-        )
+        return _measure(training_config, device, device_index, max_gemms, stream_array_mib)
     finally:
         try:
             torch.cuda.synchronize(device)
@@ -120,59 +105,18 @@ def run_hardware_calibration(
             pass
 
 
-def _measure(
-    training_config, device, device_index, max_gemms, stream_array_mib, gemm_backend=None, gpu_arch=None
-) -> Dict[str, Any]:
+def _measure(training_config, device, device_index, max_gemms, stream_array_mib) -> Dict[str, Any]:
     info = describe_device(device_index)
     reader = make_clock_reader(info)
     try:
-        return _measure_with_reader(
-            training_config, device, info, reader, max_gemms, stream_array_mib, gemm_backend, gpu_arch
-        )
+        return _measure_with_reader(training_config, device, info, reader, max_gemms, stream_array_mib)
     finally:
         if reader is not None:
             reader.close()
 
 
-def _clock_model(info, gemm_backend=None, gpu_arch=None) -> Dict[str, Any]:
-    """The GEMM model the clock is solved with, and what it knows about the device.
-
-    The hardware profile is the device's own when Primus recognises it, else
-    *gpu_arch*.  A registered *gemm_backend* other than Origami is tried first;
-    it also supplies the spec HBM peak and matrix-core rates when Primus has
-    none for the device.
-    """
-    profile_key, profile_source = info.profile_key, "device"
-    if profile_key is None and gpu_arch:
-        profile_key, profile_source = gpu_arch.strip().lower(), "--gpu-arch"
-    model = {
-        "profile_key": profile_key,
-        "profile_source": profile_source if profile_key else None,
-        "name": None,
-        "predictor": None,
-        "peak_hbm_gbps": info.peak_hbm_gbps,
-        "matrix_rates": None,
-    }
-    if profile_key is None:
-        return model
-    name = (gemm_backend or "origami").strip().lower()
-    if name != "origami":
-        predictor, backend = make_backend_predictor(name, profile_key, info.num_cus)
-        if predictor is not None:
-            model.update(name=name, predictor=predictor, matrix_rates=backend.matrix_flops_per_cu_per_clk())
-            if model["peak_hbm_gbps"] is None:
-                model["peak_hbm_gbps"] = backend.hbm_bandwidth_gbps
-            return model
-    predictor = make_origami_predictor(profile_key, info.num_cus)
-    if predictor is not None:
-        model.update(name="origami", predictor=predictor)
-        if model["peak_hbm_gbps"] is None:
-            model["peak_hbm_gbps"] = _peak_hbm_gbps(profile_key)
-    return model
-
-
 def _measure_with_reader(
-    training_config, device, info, reader, max_gemms, stream_array_mib, gemm_backend=None, gpu_arch=None
+    training_config, device, info, reader, max_gemms, stream_array_mib
 ) -> Dict[str, Any]:
     try:
         shape_counts, dtypes = collect_workload_gemms(training_config)
@@ -201,17 +145,8 @@ def _measure_with_reader(
                 dtype_notes.append(note)
     gemm_clock_summary = gemm_clocks.summary()
     live_sclk = (gemm_clock_summary["sclk"] or {}).get("median_mhz")
-    model = _clock_model(info, gemm_backend, gpu_arch)
-    compute = back_calculate_compute_clock(
-        measurements,
-        info.gcn_arch,
-        info.num_cus,
-        model["predictor"],
-        live_sclk,
-        matrix_rates=model["matrix_rates"],
-        model=model["name"] or "origami",
-        matrix_loop=_run_matrix_loop(device, info, reader),
-    )
+    predictor = make_origami_predictor(info.profile_key, info.num_cus) if info.profile_key else None
+    compute = back_calculate_compute_clock(measurements, info.gcn_arch, info.num_cus, predictor, live_sclk)
     for row, (shape, _), settle in zip(compute["gemms"], selected, settles):
         row["settle"] = settle
         row["workload_dtype"] = shape.dtype
@@ -221,8 +156,6 @@ def _measure_with_reader(
         dtype_notes=dtype_notes,
         workload_dtypes=sorted(dtypes),
         workload_unique_gemms=len(shape_counts),
-        model_profile_key=model["profile_key"],
-        model_profile_source=model["profile_source"],
         max_sclk_mhz=info.max_sclk_mhz,
         clock_source=gemm_clock_summary["source"],
         observed_sclk=gemm_clock_summary["sclk"],
@@ -244,36 +177,12 @@ def _measure_with_reader(
         **derive_model_hbm_bandwidth(sustained),
         **analyze_memory_clock(
             sustained,
-            model["peak_hbm_gbps"],
+            info.peak_hbm_gbps,
             info.max_mclk_mhz,
             observed_mclk["median_mhz"] if observed_mclk else None,
         ),
     }
     return {"device": info.to_dict(), "compute": compute, "memory": memory}
-
-
-def _run_matrix_loop(device, info, reader) -> Optional[Dict[str, Any]]:
-    """The matrix-core loop's result with the SCLK sampled during it; *None* where it cannot run.
-
-    A failure is recorded under ``"error"`` rather than raised: the loop is a
-    cross-check, and the GEMM-based clock does not depend on it.
-    """
-    import torch
-
-    if matrix_loop_unavailable_reason(info.gcn_arch) is not None:
-        return None
-    try:
-        with ClockSampler(reader) as loop_clocks:
-            # Full settle: the clock moves when the load switches from GEMMs to matrix cores only.
-            result = run_matrix_core_loop(
-                device, info.num_cus, sampler=loop_clocks, min_settle_s=DEFAULT_MIN_SETTLE_S
-            )
-    except torch.cuda.OutOfMemoryError:
-        raise
-    except Exception as exc:
-        return {"error": f"{type(exc).__name__}: {exc}"}
-    result["observed_sclk"] = loop_clocks.summary()["sclk"]
-    return result
 
 
 def _time_workload_gemm(shape, device, gcn_arch=None, **timing_kwargs):
@@ -402,47 +311,6 @@ def _per_rank_lines(per_rank: List[Dict[str, Any]]) -> List[str]:
     return lines
 
 
-_INVERSION_METHODS = ("origami-inversion", "model-inversion")
-
-
-def _model_label(comp: Dict[str, Any]) -> str:
-    """The clock model's name for the report, with the hardware profile it was given."""
-    name = comp.get("model") or "origami"
-    label = "Origami" if name == "origami" else name
-    if comp.get("model_profile_source") == "--gpu-arch":
-        label += f" ({comp['model_profile_key']} from --gpu-arch)"
-    return label
-
-
-def _matrix_loop_lines(loop: Optional[Dict[str, Any]]) -> List[str]:
-    if not loop:
-        return []
-    if "error" in loop:
-        return [f"  Matrix-core loop failed: {loop['error']}"]
-    lines = [
-        f"  Matrix-core loop ({loop['dtype']} WMMA, {loop['waves_per_cu']} waves/CU, "
-        f"settled after {_settle_label(loop.get('settle'))}): {loop['achieved_tflops']:.1f} TFLOPS",
-        f"    clock from shader-cycle counter: {loop['clock_mhz']:.0f} MHz "
-        f"(waves {loop['min_wave_mhz']:.0f}-{loop['max_wave_mhz']:.0f}; "
-        f"real-time counter {loop['realtime_counter_mhz']:.1f} MHz)",
-    ]
-    rate = loop.get("rate_clock_mhz")
-    if rate:
-        lines.append(
-            f"    clock from matrix-core rate:     {rate:.0f} MHz "
-            f"({rate / loop['clock_mhz']:.0%} matrix-core utilisation at the cycle-counter clock)"
-        )
-    else:
-        lines.append("    clock from matrix-core rate:     n/a (no FLOPs/CU/clock rate for this part)")
-    sclk = loop.get("observed_sclk")
-    if sclk:
-        lines.append(
-            f"    observed SCLK during the loop: median {sclk['median_mhz']:.0f} MHz "
-            f"({loop['clock_mhz'] / sclk['median_mhz'] - 1:+.1%} cycle counter vs observed)"
-        )
-    return lines
-
-
 def format_calibration_report(payload: Dict[str, Any]) -> str:
     per_rank = payload.get("per_rank") or []
     if "error" in payload:
@@ -477,22 +345,14 @@ def format_calibration_report(payload: Dict[str, Any]) -> str:
     eff = comp.get("effective_clock_mhz")
     max_sclk = comp.get("max_sclk_mhz")
     pct = f", {eff / max_sclk:.0%} of {max_sclk} MHz max" if eff and max_sclk else ""
-    if comp.get("method") in _INVERSION_METHODS:
+    if comp.get("method") == "origami-inversion":
         clamp_note = " (clamped to search bound)" if comp.get("clamped") else ""
-        lines.append(
-            f"  Effective compute clock: {eff:.0f} MHz ({_model_label(comp)} inversion{pct}){clamp_note}"
-        )
+        lines.append(f"  Effective compute clock: {eff:.0f} MHz (Origami inversion{pct}){clamp_note}")
         lines.append(f"  MFMA-peak lower bound:   {_fmt(comp.get('mfma_bound_clock_mhz'))} MHz")
     elif comp.get("method") == "live-sclk":
         lines.append(
             f"  Effective compute clock: {eff:.0f} MHz (live SCLK during the timed GEMMs{pct}; "
             "Origami cannot invert these GEMMs)"
-        )
-        lines.append(f"  MFMA-peak lower bound:   {_fmt(comp.get('mfma_bound_clock_mhz'))} MHz")
-    elif comp.get("method") == "matrix-loop-cycle-counter":
-        lines.append(
-            f"  Effective compute clock: {eff:.0f} MHz (shader-cycle counter in the matrix-core loop{pct}; "
-            "no GEMM model or live SCLK)"
         )
         lines.append(f"  MFMA-peak lower bound:   {_fmt(comp.get('mfma_bound_clock_mhz'))} MHz")
     elif comp.get("method") == "mfma-peak-lower-bound":
@@ -512,18 +372,16 @@ def format_calibration_report(payload: Dict[str, Any]) -> str:
         per_xcd = sclk.get("per_xcd_median_mhz") or []
         if len(per_xcd) > 1:
             lines.append(f"    per-XCD medians: {', '.join(f'{v:.0f}' for v in per_xcd)} MHz")
-        if eff and comp.get("method") in _INVERSION_METHODS:
-            model = "Origami" if (comp.get("model") or "origami") == "origami" else comp["model"]
+        if eff and comp.get("method") == "origami-inversion":
             lines.append(
-                f"    {model}-inverted clock is {eff / sclk['median_mhz'] - 1:+.1%} vs observed "
-                f"({model} model bias on these shapes)"
+                f"    Origami-inverted clock is {eff / sclk['median_mhz'] - 1:+.1%} vs observed "
+                "(Origami model bias on these shapes)"
             )
     if comp.get("all_settled") is False:
         lines.append(
             f"  WARNING: SCLK did not settle within {SETTLE_TIMEOUT_S:g} s for every GEMM; clocks may be unstable"
         )
-    lines += _matrix_loop_lines(comp.get("matrix_loop"))
-    if eff and comp.get("method") in _INVERSION_METHODS + ("live-sclk", "matrix-loop-cycle-counter"):
+    if eff and comp.get("method") in ("origami-inversion", "live-sclk"):
         lines.append(f"  To simulate at this clock: --gpu-clock-mhz {eff:.0f}")
 
     stream = mem["stream"]
